@@ -274,11 +274,6 @@
   }
   .card::-webkit-scrollbar{width:6px}
   .card::-webkit-scrollbar-thumb{background:rgba(120,180,255,.35);border-radius:6px}
-    background:linear-gradient(165deg,rgba(30,46,92,.92),rgba(10,16,38,.94));
-    border:1px solid rgba(140,190,255,.28);
-    box-shadow:0 30px 90px rgba(0,0,0,.6), inset 0 1px 0 rgba(255,255,255,.16);
-    animation:cardIn .45s cubic-bezier(.16,1.1,.3,1);
-  }
   @keyframes cardIn{from{opacity:0;transform:translateY(26px) scale(.94)}to{opacity:1;transform:none}}
   .card h2{font-size:22px;font-weight:900;letter-spacing:.5px;margin-bottom:4px}
   .card .sub{font-size:12px;color:var(--sub);margin-bottom:16px;line-height:1.6}
@@ -7704,6 +7699,1082 @@ three/build/three.module.js:
 })();
 
 /* ===== /xray-label-dim ===== */
+
+/* ===== @ xray-cinema-pro · 电影级视觉 / 动态增强层 ===== */
+(function () {
+  "use strict";
+
+  /* 引擎符号自检：缺少任一核心符号就整体跳过，保证原游戏不受影响 */
+  if (typeof an === "undefined" || typeof Ot === "undefined" || typeof dn === "undefined" ||
+      typeof ot === "undefined" || typeof Xt === "undefined" || typeof st === "undefined" ||
+      typeof W === "undefined" || typeof vt === "undefined" || typeof un === "undefined" ||
+      typeof Tt === "undefined" || typeof At === "undefined" || typeof C === "undefined" ||
+      typeof Je === "undefined" || typeof $ === "undefined") {
+    try { console.warn("[X-RAY-PRO] 引擎符号缺失，3D 增强已跳过"); } catch (e) { }
+    return;
+  }
+
+  var V3 = C;                                   /* Vector3 */
+  var LOG = function (m) { try { console.log("[X-RAY-PRO] " + m); } catch (e) { } };
+
+  /* ------------------------------------------------------------------
+     1. 类注册表：从已建好的场景反推被压缩的 three.js 类，
+        避免依赖 minify 后的名字（升级/重排也不会失效）
+     ------------------------------------------------------------------ */
+  var K = {};
+  (function () {
+    try {
+      var cnt = 0;
+      an.traverse(function (o) {
+        if (cnt++ > 8000) return;
+        if (o.geometry && o.geometry.type && !K[o.geometry.type]) K[o.geometry.type] = o.geometry.constructor;
+        if (o.isMesh && !K.Mesh) K.Mesh = o.constructor;
+        if (o.isPoints && !K.Points) { K.Points = o.constructor; if (o.material) K.PointsMaterial = o.material.constructor; }
+        if (o.isSprite && !K.Sprite) K.Sprite = o.constructor;
+        if (!K.Vector3 && o.position) K.Vector3 = o.position.constructor;
+        if (o.geometry && o.geometry.attributes && o.geometry.attributes.position && !K.BufferAttribute)
+          K.BufferAttribute = o.geometry.attributes.position.constructor;
+        var ms = o.material ? (Array.isArray(o.material) ? o.material : [o.material]) : [];
+        for (var i = 0; i < ms.length; i++) {
+          var m = ms[i]; if (!m) continue;
+          if (m.type && !K[m.type]) K[m.type] = m.constructor;
+          if (m.blending === 2 && K.ADD === undefined) K.ADD = 2;
+          if (m.side === 2 && K.DOUBLE === undefined) K.DOUBLE = 2;
+          if (m.color && !K.Color) K.Color = m.color.constructor;
+        }
+      });
+    } catch (e) { }
+  })();
+  if (!K.Mesh) K.Mesh = $;
+  if (!K.Color) K.Color = (typeof Ce !== "undefined") ? Ce : null;
+  if (!K.ADD) K.ADD = 2;
+  if (!K.DOUBLE) K.DOUBLE = 2;
+
+  /* 柔光圆点贴图（径向渐变；新增粒子与既有粒子共用，避免出现方块点） */
+  var GLOW = (function () {
+    try {
+      if (typeof Fn === "undefined") return null;
+      var cv = document.createElement("canvas"); cv.width = cv.height = 64;
+      var cx = cv.getContext("2d");
+      var gr = cx.createRadialGradient(32, 32, 0, 32, 32, 32);
+      gr.addColorStop(0, "rgba(255,255,255,1)");
+      gr.addColorStop(0.26, "rgba(255,255,255,.74)");
+      gr.addColorStop(0.62, "rgba(255,255,255,.16)");
+      gr.addColorStop(1, "rgba(255,255,255,0)");
+      cx.fillStyle = gr; cx.fillRect(0, 0, 64, 64);
+      return new Fn(cv);
+    } catch (e) { return null; }
+  })();
+
+  /* 半透明加色材质工厂 */
+  function basic(color, op) {
+    try {
+      if (K.MeshBasicMaterial) {
+        return new K.MeshBasicMaterial({
+          color: color, transparent: true, opacity: op,
+          blending: K.ADD, depthWrite: false, side: K.DOUBLE, toneMapped: false
+        });
+      }
+      if (typeof je === "function") return je(color, { op: op });
+    } catch (e) { }
+    return null;
+  }
+
+  /* ------------------------------------------------------------------
+     1b. 设备能力分级（首屏卡顿的主因就是"不分机型都上最高配"）
+     ------------------------------------------------------------------ */
+  var TIER = (function () {
+    try {
+      var dpr = window.devicePixelRatio || 1;
+      var cores = navigator.hardwareConcurrency || 4;
+      var mem = navigator.deviceMemory || 8;
+      return { dpr: dpr, cores: cores, mem: mem, strong: (cores >= 6 && mem >= 4) };
+    } catch (e) { return { dpr: 1, cores: 4, mem: 8, strong: true }; }
+  })();
+
+  /* ------------------------------------------------------------------
+     2. 渲染质量：像素比 / 阴影 / 辉光 / 曝光（按机型设上限）
+     ------------------------------------------------------------------ */
+  var QUAL = { baseDpr: 1, low: false, acc: 0, frames: 0 };
+  (function () {
+    try {
+      QUAL.baseDpr = Math.min(window.devicePixelRatio || 1, TIER.strong ? 2 : 1.25);
+      Ot.setPixelRatio(QUAL.baseDpr);
+      Ot.setSize(window.innerWidth, window.innerHeight);
+      try { if (typeof Kl !== "undefined") Ot.shadowMap.type = Kl; } catch (e) { }
+      try { if (typeof cd !== "undefined" && cd) { cd.strength = 0.72; cd.radius = 0.62; cd.threshold = 0.64; } } catch (e) { }
+      try { Ot.toneMappingExposure = 1.1; } catch (e) { }
+    } catch (e) { }
+  })();
+
+  /* ------------------------------------------------------------------
+     3. 贴图高清化：格子标签 256→512、棋子名牌 256×72→512×144
+        （md / M_ 内部坐标全是硬编码，按倍率缩放 canvas + ctx 即可无损升采样）
+        低端机 MUL=1（保持原 256），并且完全跳过重绘，省掉几十次 canvas 绘制
+     ------------------------------------------------------------------ */
+  (function () {
+    if (typeof md !== "function" && typeof M_ !== "function") return;
+    var MUL = TIER.strong ? 2 : 1, MAXA = 4;
+    try { MAXA = Ot.capabilities.getMaxAnisotropy() || 4; } catch (e) { }
+    var origCreate = document.createElement;
+    var origGetCtx = HTMLCanvasElement.prototype.getContext;
+
+    function hiRes(fn, self, args) {
+      document.createElement = function (tag) {
+        var el = origCreate.call(document, tag);
+        if (String(tag).toLowerCase() === "canvas") {
+          try {
+            var w = 0, h = 0, patched = false;
+            Object.defineProperty(el, "width", {
+              configurable: true, enumerable: true,
+              get: function () { return w; },
+              set: function (v) { w = Math.round((+v || 0) * MUL); el.setAttribute("width", w); }
+            });
+            Object.defineProperty(el, "height", {
+              configurable: true, enumerable: true,
+              get: function () { return h; },
+              set: function (v) { h = Math.round((+v || 0) * MUL); el.setAttribute("height", h); }
+            });
+            el.getContext = function () {
+              var ctx = origGetCtx.apply(el, arguments);
+              if (!patched && ctx && ctx.scale) { ctx.scale(MUL, MUL); patched = true; }
+              return ctx;
+            };
+          } catch (e) { }
+        }
+        return el;
+      };
+      try { return fn.apply(self, args); }
+      finally { document.createElement = origCreate; }
+    }
+
+    try {
+      var _md = md;
+      md = function () {
+        try {
+          var t = hiRes(_md, this, arguments);
+          if (t && t.anisotropy !== undefined) t.anisotropy = MAXA;
+          return t;
+        } catch (e) { return _md.apply(this, arguments); }
+      };
+    } catch (e) { }
+
+    try {
+      var _M = M_;
+      M_ = function () {
+        try { return hiRes(_M, this, arguments); } catch (e) { return _M.apply(this, arguments); }
+      };
+    } catch (e) { }
+
+    /* 重绘全部格子贴图（并顺手修掉旧贴图未释放的泄漏） */
+    try {
+      var _yc = yc;
+      yc = function (i) {
+        var e = un[i];
+        var old = (e && e.top && e.top.material) ? e.top.material.map : null;
+        var r = _yc.apply(this, arguments);
+        try {
+          var nw = (e && e.top && e.top.material) ? e.top.material.map : null;
+          if (old && nw && old !== nw && old.dispose) old.dispose();
+        } catch (ee) { }
+        return r;
+      };
+      /* 关键：绝不在首屏同步重绘 48 张贴图。
+         让开 loading 消失 + 开始弹窗出现之后，再按每帧 6ms 的预算分帧补做，
+         主线程始终有空隙，表现为"先能玩、画质随后变清晰"。 */
+      if (MUL > 1) {
+        var queue = [];
+        for (var q0 = 0; q0 < vt.length; q0++) queue.push(q0);
+        var step = function () {
+          var t0 = (typeof performance !== "undefined" ? performance.now() : Date.now());
+          var now = t0;
+          while (queue.length && (now - t0) < 6) {
+            try { yc(queue.shift()); } catch (ee) { }
+            now = (typeof performance !== "undefined" ? performance.now() : Date.now());
+          }
+          if (queue.length) setTimeout(step, 16);
+          else { try { console.log("[X-RAY-PRO] 高清贴图分帧补做完成"); } catch (e) { } }
+        };
+        setTimeout(step, 80);
+      }
+    } catch (e) { }
+  })();
+
+  /* ------------------------------------------------------------------
+     4. 相机：目标点柔化 + 开场电影运镜
+     ------------------------------------------------------------------ */
+  var CAM = { goal: null };
+  function cinematicIntro() {
+    try {
+      var tgt0 = CAM.goal ? CAM.goal.clone() : new V3(0, 1.2, 0);
+      var endP = Xt.position.clone();
+      var r0 = 132, th = -1.35, ph = 0.27;
+      var startP = new V3(
+        tgt0.x + r0 * Math.sin(ph) * Math.sin(th),
+        tgt0.y + r0 * Math.cos(ph),
+        tgt0.z + r0 * Math.sin(ph) * Math.cos(th)
+      );
+      var wasEn = st.enabled;
+      st.autoRotate = false; st.enabled = false;
+      Xt.position.copy(startP);
+      if (typeof Qt === "function" && typeof Nr === "function") {
+        Qt(3.4, function (p) {
+          Xt.position.lerpVectors(startP, endP, p);
+          Xt.lookAt(tgt0);
+        }, function () {
+          st.enabled = wasEn; st.autoRotate = true;
+          try { if (typeof hi === "function") hi(new V3(0, 0.5, 0), 0x4ff0ff, 5.5, 1.1); } catch (e) { }
+        }, Nr);
+      } else {
+        st.enabled = wasEn; st.autoRotate = true;
+      }
+    } catch (e) { }
+  }
+  (function () {
+    try {
+      CAM.goal = st.target.clone();
+      var tgt = st.target;
+      var last = tgt.clone();
+      /* 代码显式设焦点 → 变成"目标"，由补间柔化过去 */
+      tgt.set = function (x, y, z) { CAM.goal.set(x, y, z); return this; };
+      tgt.copy = function (v) { CAM.goal.copy(v); return this; };
+      dn.push(function (t, d) {
+        try {
+          /* 引擎/玩家的外部改动（例如 OrbitControls 平移）→ 直接采纳，避免被拉回 */
+          if (tgt.distanceToSquared(last) > 4e-4) CAM.goal.copy(tgt);
+          tgt.lerp(CAM.goal, 1 - Math.pow(0.0008, Math.min(d, 0.1)));
+          last.copy(tgt);
+        } catch (e) { }
+      });
+    } catch (e) { }
+  })();
+
+  /* ------------------------------------------------------------------
+     5. 当前玩家：光柱 + 双层旋转地环（焦点引导）
+     ------------------------------------------------------------------ */
+  (function () {
+    try {
+      if (!K.Mesh || typeof Wt === "undefined" || typeof ri === "undefined") return;
+      var m1 = basic(0x9ff8ff, 0.12);
+      var m2 = basic(0xffd76a, 0.42);
+      var m3 = basic(0x4ff0ff, 0.22);
+      if (!m1 || !m2 || !m3) return;
+
+      var pil = new K.Mesh(new Wt(0.92, 1.5, 11, 30, 1, true), m1);
+      pil.position.y = 5.5; pil.visible = false; Vs.add(pil);
+      var r1 = new K.Mesh(new ri(1.12, 1.4, 72), m2);
+      r1.rotation.x = -Math.PI / 2; r1.visible = false; Vs.add(r1);
+      var r2 = new K.Mesh(new ri(1.66, 1.82, 72), m3);
+      r2.rotation.x = -Math.PI / 2; r2.visible = false; Vs.add(r2);
+
+      dn.push(function (t) {
+        var i = (W && !W.over) ? W.cur : -1;
+        var p = (i >= 0 && W.PAWNS && W.PAWNS[i]) ? W.PAWNS[i] : null;
+        var roam = (typeof ve !== "undefined" && ve && ve.on);
+        var vis = !!p && !roam;
+        pil.visible = r1.visible = r2.visible = vis;
+        if (!vis) return;
+        var g = p.group.position;
+        pil.position.set(g.x, 5.5, g.z);
+        r1.position.set(g.x, 0.1, g.z);
+        r2.position.set(g.x, 0.1, g.z);
+        var b = 0.5 + 0.5 * Math.sin(t * 2.1);
+        r1.rotation.z = t * 0.85;
+        r2.rotation.z = -t * 0.5;
+        r1.material.opacity = 0.28 + 0.30 * b;
+        r2.material.opacity = 0.10 + 0.16 * (1 - b);
+        pil.material.opacity = 0.06 + 0.07 * b;
+        var s = 1 + 0.05 * Math.sin(t * 1.5);
+        pil.scale.set(s, 1, s);
+      });
+    } catch (e) { }
+  })();
+
+  /* ------------------------------------------------------------------
+     6. 城市上空全息 HUD 弧环（科技金融感）
+     ------------------------------------------------------------------ */
+  (function () {
+    try {
+      if (!K.Mesh || typeof ri === "undefined" || typeof Je === "undefined") return;
+      var defs = [
+        [24.5, 17.5, 0.16, 0x4ff0ff, 0.20],
+        [19.0, 23.0, -0.12, 0xffd76a, 0.16],
+        [29.0, 12.5, 0.09, 0x8b5cff, 0.13]
+      ];
+      var arcs = [];
+      for (var k = 0; k < defs.length; k++) {
+        var d = defs[k];
+        var mm = basic(d[3], d[4]);
+        if (!mm) continue;
+        var g = new Je();
+        for (var i = 0; i < 3; i++) {
+          var a = new K.Mesh(new ri(d[0], d[0] + 0.3, 96, 1, i * 2.0944, 0.44), mm);
+          a.rotation.x = -Math.PI / 2;
+          g.add(a);
+        }
+        g.position.y = d[1];
+        Vs.add(g);
+        arcs.push({ g: g, s: d[2], y: d[1] });
+      }
+      dn.push(function (t) {
+        for (var i = 0; i < arcs.length; i++) {
+          arcs[i].g.rotation.y = t * arcs[i].s;
+          arcs[i].g.position.y = arcs[i].y + Math.sin(t * 0.45 + i * 1.7) * 0.55;
+        }
+      });
+    } catch (e) { }
+  })();
+
+  /* ------------------------------------------------------------------
+     7. 数据雨粒子（财富数据流）
+     ------------------------------------------------------------------ */
+  (function () {
+    try {
+      var PG = K.BufferGeometry, BA = K.BufferAttribute, PTS = K.Points;
+      if (!PG || !BA || !PTS || !K.Color) return;
+      var PM = K.PointsMaterial || null;
+      var glowTex = GLOW;
+      var N = TIER.strong ? 400 : 150;
+      var pos = new Float32Array(N * 3), col = new Float32Array(N * 3), spd = new Float32Array(N);
+      var c1 = new K.Color(0x4ff0ff), c2 = new K.Color(0xffd76a), c3 = new K.Color(0x8b5cff);
+      for (var i = 0; i < N; i++) {
+        var a = Math.random() * Math.PI * 2, r = 4 + Math.random() * 46;
+        pos[i * 3] = Math.cos(a) * r;
+        pos[i * 3 + 1] = Math.random() * 34;
+        pos[i * 3 + 2] = Math.sin(a) * r;
+        var q = Math.random(), c = q < 0.6 ? c1 : (q < 0.88 ? c2 : c3);
+        col[i * 3] = c.r; col[i * 3 + 1] = c.g; col[i * 3 + 2] = c.b;
+        spd[i] = 0.8 + Math.random() * 2.6;
+      }
+      var g = new PG();
+      g.setAttribute("position", new BA(pos, 3));
+      g.setAttribute("color", new BA(col, 3));
+      var mm;
+      if (PM) {
+        var pmo = {
+          size: 0.26, vertexColors: true, transparent: true, opacity: 0.85,
+          blending: K.ADD, depthWrite: false, sizeAttenuation: true, toneMapped: false
+        };
+        if (glowTex) pmo.map = glowTex;
+        mm = new PM(pmo);
+      } else { return; }
+      var pts = new PTS(g, mm);
+      pts.frustumCulled = false;
+      Vs.add(pts);
+      dn.push(function (t, d) {
+        var arr = g.attributes.position.array, dt = Math.min(d, 0.08);
+        for (var i = 0; i < N; i++) {
+          var iy = i * 3 + 1;
+          arr[iy] += spd[i] * dt;
+          if (arr[iy] > 34) arr[iy] = 0;
+          arr[i * 3] += Math.sin(t * 0.6 + i) * 0.004;
+        }
+        g.attributes.position.needsUpdate = true;
+        mm.opacity = 0.55 + 0.2 * Math.sin(t * 0.8);
+      });
+    } catch (e) { }
+  })();
+
+  /* ------------------------------------------------------------------
+     7b. 修掉原版"方块状"尘埃粒子：换成柔光圆点（纯视觉，不动逻辑）
+     ------------------------------------------------------------------ */
+  var GLOWFIX = 0;
+  (function () {
+    try {
+      if (!GLOW) return;
+      an.traverse(function (o) {
+        if (!o.isPoints || !o.material || o.material.isPointsMaterial !== true) return;
+        if (o.material.map) return;
+        if (!(o.material.size > 0.05)) return;
+        o.material.map = GLOW;
+        o.material.transparent = true;
+        o.material.depthWrite = false;
+        o.material.needsUpdate = true;
+        GLOWFIX++;
+      });
+      if (GLOWFIX) LOG("已把 " + GLOWFIX + " 组方块粒子换成柔光圆点");
+    } catch (e) { }
+  })();
+
+  /* ------------------------------------------------------------------
+     7c. 星尘：把近景"方块大点"收敛成细碎星光（纯视觉，不动逻辑）
+     ------------------------------------------------------------------ */
+  var STARFIX = 0;
+  (function () {
+    try {
+      an.traverse(function (o) {
+        if (!o.isPoints) return;
+        var g = o.geometry;
+        if (!g || !g.attributes || !g.attributes.aSize) return;   /* aSize 是该星尘的点径属性，独一无二 */
+        /* 1) 点径封顶 */
+        var arr = g.attributes.aSize.array;
+        for (var i = 0; i < arr.length; i++) if (arr[i] > 1.25) arr[i] = 1.25;
+        g.attributes.aSize.needsUpdate = true;
+        /* 2) 把过近的星点推到半径 130 以外（根因：gl_PointSize ∝ 1/距离，近距离会撑成巨块） */
+        var pos = g.attributes.position.array;
+        for (var j = 0; j < pos.length; j += 3) {
+          var x = pos[j], y = pos[j + 1], z = pos[j + 2];
+          var L = Math.sqrt(x * x + y * y + z * z);
+          if (L > 0.001 && L < 130) {
+            var k = 130 / L;
+            pos[j] = x * k; pos[j + 1] = y * k; pos[j + 2] = z * k;
+          }
+        }
+        g.attributes.position.needsUpdate = true;
+        o.frustumCulled = false;
+        STARFIX++;
+      });
+      if (STARFIX) LOG("星尘点径已收敛（" + STARFIX + " 组）");
+    } catch (e) { }
+  })();
+
+  /* ------------------------------------------------------------------
+     8. X-RAY 扫描波（地面双层扩散环 + 轻微震屏）
+     ------------------------------------------------------------------ */
+  var fireScan = null;
+  (function () {
+    try {
+      if (!K.Mesh || typeof ri === "undefined") return;
+      var s1 = basic(0x4ff0ff, 0), s2 = basic(0xffffff, 0);
+      if (!s1 || !s2) return;
+      var a = new K.Mesh(new ri(0.6, 1.05, 96), s1);
+      var b = new K.Mesh(new ri(0.6, 0.8, 96), s2);
+      [a, b].forEach(function (o) {
+        o.rotation.x = -Math.PI / 2; o.position.y = 0.16; o.visible = false; Vs.add(o);
+      });
+      var busy = false;
+      fireScan = function () {
+        if (busy) return;
+        busy = true;
+        [a, b].forEach(function (o, k) {
+          setTimeout(function () {
+            try {
+              o.visible = true;
+              Qt(1.45, function (p) {
+                var s = 2 + p * 44;
+                o.scale.set(s, s, s);
+                o.material.opacity = 0.55 * (1 - p) * (1 - p * 0.25);
+              }, function () { o.visible = false; }, Nr);
+            } catch (e) { }
+          }, k * 240);
+        });
+        try { if (typeof Ki === "function") Ki(0.1); } catch (e) { }
+        setTimeout(function () { busy = false; }, 1900);
+      };
+      var last = 0;
+      dn.push(function (t) { if (t - last > 18) { last = t; fireScan(); } });
+    } catch (e) { }
+  })();
+
+  /* ------------------------------------------------------------------
+     9. 事件联动：横幅 / 升级 / 开局
+     ------------------------------------------------------------------ */
+  (function () {
+    try {
+      var _hn = hn, lastB = 0;
+      hn = function () {
+        var r = _hn.apply(this, arguments);
+        try {
+          var now = (typeof performance !== "undefined" ? performance.now() : Date.now());
+          if (fireScan && now - lastB > 3200) { lastB = now; fireScan(); }
+        } catch (e) { }
+        return r;
+      };
+    } catch (e) { }
+  })();
+  (function () {
+    try {
+      if (typeof Mc !== "function") return;
+      var _Mc = Mc;
+      Mc = function (i, e) {
+        var r = _Mc.apply(this, arguments);
+        try { if (typeof hi === "function") hi(i, 0xffd76a, 4.8, 1.15); } catch (ee) { }
+        return r;
+      };
+    } catch (e) { }
+  })();
+  (function () {
+    try {
+      if (typeof sy !== "function") return;
+      var _sy = sy;
+      sy = function () {
+        var r = _sy.apply(this, arguments);
+        try {
+          if (typeof bc !== "undefined") document.documentElement.setAttribute("data-mode", bc);
+          document.documentElement.classList.add("in-game");
+          setTimeout(function () { try { cinematicIntro(); } catch (e) { } }, 420);
+        } catch (e) { }
+        return r;
+      };
+    } catch (e) { }
+  })();
+
+  /* ------------------------------------------------------------------
+     10. 自适应画质：低于 42fps 自动降像素比并降级 CSS 特效
+     ------------------------------------------------------------------ */
+  dn.push(function (t, d) {
+    if (t < 7 || QUAL.low) return;
+    QUAL.acc += d; QUAL.frames++;
+    if (QUAL.acc >= 2) {
+      var fps = QUAL.frames / QUAL.acc;
+      QUAL.acc = 0; QUAL.frames = 0;
+      if (fps < 42) {
+        QUAL.low = true;
+        try { Ot.setPixelRatio(Math.min(1.25, QUAL.baseDpr)); Ot.setSize(window.innerWidth, window.innerHeight); } catch (e) { }
+        try { document.documentElement.classList.add("lowfx"); } catch (e) { }
+        LOG("性能自适应：已降级画质");
+      }
+    }
+  });
+
+  /* ------------------------------------------------------------------
+     11. 演示 / 调试接口（同时修复演示局模式读取 window.GAME 失效的问题）
+     ------------------------------------------------------------------ */
+  try {
+    window.GAME = { CFG: ft, STATE: W, PLAYERS: (typeof zn !== "undefined" ? zn : null) };
+    window.XRAY = {
+      scene: an, camera: Xt, renderer: Ot, controls: st, state: W, tiles: un,
+      _K: K, _basic: basic, glowFix: GLOWFIX, starFix: STARFIX, tier: TIER,
+      bloom: (typeof cd !== "undefined" ? cd : null),
+      scan: function () { try { fireScan && fireScan(); } catch (e) { } },
+      intro: function () { try { cinematicIntro(); } catch (e) { } },
+      net: function (i) { try { return Ys(W, W.players[i || 0]); } catch (e) { return 0; } }
+    };
+  } catch (e) { }
+
+  LOG("电影级视觉增强已启用 · 贴图 ×2 · 目标点柔化 · 扫描波 · 数据雨");
+})();
+
+/* ===== @ xray-feel-pro · 游戏反馈层（把引擎状态变化翻译成视听反馈） ===== */
+(function () {
+  "use strict";
+  if (typeof W === "undefined" || typeof dn === "undefined" || typeof un === "undefined" ||
+      typeof Tt === "undefined" || typeof C === "undefined") return;
+  try {
+    var XR = (typeof window !== "undefined" && window.XRAY) ? window.XRAY : null;
+    var K2 = (XR && XR._K) ? XR._K : {};
+    var basic2 = (XR && XR._basic) ? XR._basic : function () { return null; };
+    var PL = (typeof zn !== "undefined") ? zn : [];
+    var FX = (typeof At !== "undefined") ? At : ((typeof Vs !== "undefined") ? Vs : null);
+    var V3c = C;
+    if (!FX || !K2.Mesh || typeof ri === "undefined") return;
+
+    /* ---------- 地面光环对象池（避免频繁 new/dispose 造成 GC 抖动） ---------- */
+    var pool = [], busy = [];
+    function mkRing() {
+      var mm = basic2(0xffffff, 0);
+      if (!mm) return null;
+      var m = new K2.Mesh(new ri(0.55, 0.8, 64), mm);
+      m.rotation.x = -Math.PI / 2;
+      m.visible = false;
+      FX.add(m);
+      return m;
+    }
+    function ring(pos, color, maxR, dur, y) {
+      try {
+        var m = pool.length ? pool.pop() : mkRing();
+        if (!m) return null;
+        m.material.color.setHex(color);
+        m.material.opacity = 0.85;
+        m.position.set(pos.x, y === undefined ? 0.2 : y, pos.z);
+        m.scale.set(1, 1, 1);
+        m.visible = true;
+        busy.push({ m: m, t: 0, dur: dur || 0.9, max: maxR || 3.4 });
+        return m;
+      } catch (e) { return null; }
+    }
+    dn.push(function (t, d) {
+      for (var i = busy.length - 1; i >= 0; i--) {
+        var s = busy[i];
+        s.t += d;
+        var p = s.t / s.dur;
+        if (p >= 1) { s.m.visible = false; pool.push(s.m); busy.splice(i, 1); continue; }
+        var e = 1 - Math.pow(1 - p, 3);
+        var sc = 0.55 + e * s.max;
+        s.m.scale.set(sc, sc, sc);
+        s.m.material.opacity = 0.85 * (1 - p) * (1 - p);
+      }
+    });
+
+    /* ---------- 棋子动感：移动挤压 + 步进拖尾 ---------- */
+    var trailT = 0, FE_ERR = 0;
+    dn.push(function (t, d) {
+      try {
+        if (!W.PAWNS) return;
+        var i, p;
+        for (i = 0; i < W.PAWNS.length; i++) {
+          p = W.PAWNS[i]; if (!p || !p.group) continue;
+          if (p.moving) {
+            var k = 1 + 0.085 * Math.sin(t * 14);
+            var r = 1 / Math.sqrt(k);
+            p.group.scale.set(r, k, r);
+          } else p.group.scale.set(1, 1, 1);
+        }
+        trailT += d;
+        if (trailT >= 0.11) {
+          trailT = 0;
+          for (i = 0; i < W.PAWNS.length; i++) {
+            p = W.PAWNS[i];
+            if (p && p.moving && p.group && PL[i]) ring(p.group.position, PL[i].color, 1.15, 0.55, 0.14);
+          }
+        }
+      } catch (e) {
+        if (!FE_ERR) { FE_ERR = 1; try { if (XR) XR.feelErr = "pawn:" + (e && e.message ? e.message : e); } catch (e2) { } }
+      }
+    });
+
+    /* ---------- 状态差分 → 视听反馈 ---------- */
+    var S = {
+      cur: -1, pos: [], owner: [], level: [], traps: [], cash: [],
+      over: false, moving: [], cashT: [], init: false
+    };
+    function pawnTop(i) {
+      var p = W.PAWNS[i];
+      return (p && p.group) ? new V3c(p.group.position.x, 2.2, p.group.position.z) : null;
+    }
+    function tileTop(i) {
+      var v = Tt[i];
+      return v ? new V3c(v.x, 0.2, v.z) : null;
+    }
+    function onTurn(i) {
+      var p = W.PAWNS[i]; if (!p || !p.group) return;
+      var pl = PL[i] || { color: 0xffd76a, css: "#ffd76a", name: "" };
+      ring(p.group.position, pl.color, 4.2, 1.05);
+      setTimeout(function () { try { ring(p.group.position, pl.color, 5.6, 1.3); } catch (e) { } }, 160);
+      try {
+        var v = pawnTop(i);
+        if (v && typeof xd === "function") xd(v, "轮到 " + pl.name, pl.css, 17);
+      } catch (e) { }
+    }
+    function onLand(i) {
+      var v = tileTop(W.pos[i]); if (!v) return;
+      var pl = PL[i] || { color: 0xffffff };
+      ring(v, pl.color, 3.6, 0.95);
+      ring(v, 0xffffff, 2.3, 0.6);
+    }
+    function onBuy(idx, o) {
+      var v = tileTop(idx); if (!v) return;
+      var pl = PL[o] || { color: 0xffd76a, css: "#ffd76a" };
+      ring(v, pl.color, 5.2, 1.2);
+      try { if (typeof Dc === "function") Dc(new V3c(v.x, 0.5, v.z), 10, pl.color); } catch (e) { }
+      try {
+        if (typeof xd === "function") {
+          var nm = (vt[idx] && vt[idx].name) ? vt[idx].name : "";
+          xd(new V3c(v.x, 2.4, v.z), "收购 · " + nm, pl.css, 16);
+        }
+      } catch (e) { }
+    }
+    function onLevel(idx) {
+      var v = tileTop(idx);
+      if (v) { ring(v, 0xffd76a, 4.4, 1.0); ring(v, 0xffffff, 3.0, 0.75); }
+    }
+    function onTrap(idx) {
+      var v = tileTop(idx);
+      if (v) ring(v, 0xff2d55, 3.4, 0.9);
+      try { if (typeof Ki === "function") Ki(0.1); } catch (e) { }
+    }
+    function onEnd() {
+      try {
+        if (typeof Uc === "function") {
+          Uc(new V3c(0, 8, 0), 60);
+          setTimeout(function () { try { Uc(new V3c(-8, 9, 6), 40); } catch (e) { } }, 320);
+          setTimeout(function () { try { Uc(new V3c(9, 9, -6), 40); } catch (e) { } }, 700);
+        }
+        if (typeof Dr === "function") Dr("rgba(255,215,106,", .3);
+        try { if (XR && XR.scan) XR.scan(); } catch (e) { }
+        /* 缓缓拉远，给"全景收尾"一个镜头 */
+        try {
+          var dv = new V3c().subVectors(Xt.position, st.target);
+          var d0 = dv.length(); dv.normalize();
+          var base = st.target.clone();
+          if (typeof Qt === "function" && typeof Nr === "function") {
+            Qt(2.8, function (p) {
+              Xt.position.copy(base).add(dv.clone().multiplyScalar(d0 + p * 18));
+            }, null, Nr);
+          }
+        } catch (e) { }
+        st.autoRotate = true;
+      } catch (e) { }
+    }
+
+    dn.push(function (t, d) {
+      try {
+        if (!W || !W.players || !W.PAWNS) return;
+        var i;
+        if (!S.init) {
+          S.init = true;
+          S.cur = W.cur;
+          S.pos = W.pos.slice();
+          S.owner = W.owner.slice();
+          S.level = W.level.slice();
+          S.traps = W.traps.slice();
+          S.over = !!W.over;
+          S.cash = [];
+          S.moving = [];
+          for (i = 0; i < W.players.length; i++) S.cash.push(W.players[i].cash);
+          for (i = 0; i < W.PAWNS.length; i++) S.moving.push(!!(W.PAWNS[i] && W.PAWNS[i].moving));
+          return;
+        }
+
+        /* 回合切换 */
+        if (W.cur !== S.cur) { S.cur = W.cur; onTurn(S.cur); }
+
+        /* 移动结束（落地） */
+        for (i = 0; i < W.PAWNS.length; i++) {
+          var p = W.PAWNS[i]; if (!p) continue;
+          var mv = !!p.moving;
+          if (S.moving[i] !== mv) { S.moving[i] = mv; if (!mv) onLand(i); }
+        }
+        for (i = 0; i < W.pos.length; i++) if (W.pos[i] !== S.pos[i]) { S.pos = W.pos.slice(); break; }
+
+        /* 归属 / 升级 / 陷阱 */
+        for (i = 0; i < W.owner.length; i++) {
+          if (W.owner[i] !== S.owner[i]) {
+            var o = W.owner[i]; S.owner[i] = o;
+            if (o !== null && o !== undefined) onBuy(i, o);
+          }
+          if (W.level[i] !== S.level[i]) { S.level[i] = W.level[i]; if (W.level[i] > 0) onLevel(i); }
+          if (W.traps[i] !== S.traps[i]) { S.traps[i] = W.traps[i]; if (W.traps[i]) onTrap(i); }
+        }
+
+        /* 现金变动飘字 */
+        for (i = 0; i < W.players.length; i++) {
+          var cv = W.players[i].cash;
+          if (cv !== S.cash[i]) {
+            var dv = cv - S.cash[i];
+            S.cash[i] = cv;
+            if (Math.abs(dv) >= 1 && t - (S.cashT[i] || -9) > 0.28) {
+              S.cashT[i] = t;
+              var v = pawnTop(i);
+              if (v && typeof xd === "function") {
+                xd(v, (dv > 0 ? "+¥" : "−¥") + Math.abs(dv).toFixed(0) + "万",
+                   dv > 0 ? "#37f5a5" : "#ff5b6e", dv > 0 ? 21 : 19);
+              }
+            }
+          }
+        }
+
+        /* 终局 */
+        if (W.over && !S.over) { S.over = true; onEnd(); }
+      } catch (e) {
+        if (!S.err) { S.err = 1; try { if (XR) XR.feelErr = String(e && e.message ? e.message : e); } catch (e2) { } }
+      }
+    });
+
+    /* ---------- 棋盘边框：数据流呼吸 + 归属染色 ---------- */
+    (function () {
+      try {
+        if (typeof $s !== "function" || typeof Ce === "undefined") return;
+        var seen = {}, i;
+        for (i = 0; i < un.length; i++) {
+          var fm = un[i] && un[i].frame && un[i].frame.material;
+          if (!fm || !fm.color) return;
+          if (seen[fm.uuid]) return;           /* 材质被共享 → 放弃，避免串色 */
+          seen[fm.uuid] = 1;
+        }
+        var base = [];
+        for (i = 0; i < un.length; i++) base.push(new Ce($s(un[i].tile)));
+        dn.push(function (t) {
+          for (var k = 0; k < un.length; k++) {
+            var fm2 = un[k].frame.material, o = W.owner[k];
+            if (o !== null && o !== undefined && PL[o]) fm2.color.setHex(PL[o].color);
+            else fm2.color.copy(base[k]);
+            fm2.color.multiplyScalar(0.92 + 0.16 * Math.sin(t * 1.15 - k * 0.17));
+          }
+        });
+      } catch (e) { }
+    })();
+
+    try { if (XR) { XR.ring = ring; XR.feel = true; } } catch (e) { }
+    try { console.log("[X-RAY-PRO] 反馈层已启用：回合 / 落点 / 收购 / 现金 / 终局联动"); } catch (e) { }
+  } catch (e) {
+    try { console.warn("[X-RAY-PRO] 反馈层未启用：", e); } catch (e2) { }
+  }
+})();
+
+/* =====================================================================
+   @ xray-solution-ui · 判定后教学卡的渲染与三档模式接线
+   guide = 强制弹卡  /  normal = 判定弹窗加「看解法」  /  hard = 不提示
+   ===================================================================== */
+(function () {
+  "use strict";
+  try {
+    window.__solDiag = {
+      vt: (typeof vt), rd: (typeof rd), data: !!(window.XRAY_SOL),
+      xray: !!(window.XRAY),
+      keys: (window.XRAY_SOL ? Object.keys(window.XRAY_SOL.SOL).length : -1)
+    };
+  } catch (e0) { try { window.__solDiag = "diag:" + e0; } catch (e1) { } }
+  if (typeof vt === "undefined" || typeof rd !== "function") return;
+  var X = (typeof window !== "undefined" && window.XRAY_SOL) ? window.XRAY_SOL : null;
+  if (!X || !X.SOL) return;
+
+  var SOL = X.SOL, CASE = X.CASE, STEP = X.STEP, RED = X.RED, YEL = X.YEL, GRN = X.GRN;
+
+  /* ---------- 样式 ---------- */
+  (function () {
+    if (document.getElementById("sol-style")) return;
+    var s = document.createElement("style");
+    s.id = "sol-style";
+    s.textContent = [
+      "#solMask{position:fixed;inset:0;z-index:12000;display:none;align-items:center;justify-content:center;",
+      "background:radial-gradient(circle at 50% 40%,rgba(8,16,40,.74),rgba(2,4,12,.92));",
+      "backdrop-filter:blur(9px);-webkit-backdrop-filter:blur(9px);padding:20px}",
+      "#solMask.on{display:flex;animation:solFade .26s ease}",
+      "@keyframes solFade{from{opacity:0}to{opacity:1}}",
+      "#solBox{width:min(680px,94vw);max-height:88vh;overflow-y:auto;border-radius:24px;padding:22px 24px;",
+      "background:linear-gradient(165deg,rgba(34,52,104,.96),rgba(9,14,34,.97));",
+      "border:1px solid rgba(150,200,255,.3);",
+      "box-shadow:0 40px 110px -20px rgba(0,0,0,.8),inset 0 1px 0 rgba(255,255,255,.16);",
+      "animation:solIn .38s cubic-bezier(.16,1.1,.3,1)}",
+      "@keyframes solIn{from{opacity:0;transform:translateY(24px) scale(.95)}to{opacity:1;transform:none}}",
+      "#solBox h3{font-size:19px;font-weight:900;margin-bottom:2px;letter-spacing:.5px}",
+      "#solBox .solsub{font-size:11.5px;color:#9fb4dd;margin-bottom:14px;letter-spacing:.6px}",
+      ".solsec{margin-bottom:11px;padding:12px 14px;border-radius:14px;",
+      "background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.09)}",
+      ".solsec .h{font-size:10.5px;font-weight:800;letter-spacing:2px;color:#4ff0ff;margin-bottom:6px}",
+      ".solsec .b{font-size:13px;line-height:1.85;color:#e2ecff}",
+      ".solsec .b b{color:#ffd76a} .solsec .b i{color:#9ff8ff;font-style:normal}",
+      ".solsec.fix{border-left:3px solid #ffd76a} .solsec.clue{border-left:3px solid #4ff0ff}",
+      ".solsec.man{border-left:3px solid #37f5a5} .solsec.next{border-left:3px solid #8b5cff}",
+      ".solsec.rev{border-left:3px solid #ff5b6e}",
+      ".sol-tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:9px}",
+      ".sol-tags span{font-size:11px;padding:3px 9px;border-radius:999px;font-weight:700}",
+      ".sol-tags span.red{background:rgba(255,91,110,.16);border:1px solid rgba(255,91,110,.45);color:#ffc2c8}",
+      ".sol-tags span.yellow{background:rgba(255,176,32,.14);border:1px solid rgba(255,176,32,.45);color:#ffdf9e}",
+      ".sol-tags span.green{background:rgba(55,245,165,.14);border:1px solid rgba(55,245,165,.45);color:#b6ffdf}",
+      ".sol-step{font-size:12px;color:#cfe0ff;background:rgba(79,240,255,.09);",
+      "border:1px solid rgba(79,240,255,.28);border-radius:10px;padding:8px 11px;margin-top:9px;line-height:1.7}",
+      ".sol-next{margin:0;padding-left:18px;font-size:12.5px;line-height:1.9;color:#dbe7ff}",
+      "#solFoot{display:flex;align-items:center;gap:10px;margin-top:14px}",
+      "#solOk{border:none;cursor:pointer;font-family:inherit;font-weight:800;font-size:14px;padding:12px 30px;",
+      "border-radius:14px;color:#0a1024;letter-spacing:1px;background:linear-gradient(135deg,#ffe08a,#ffb020);",
+      "box-shadow:0 8px 22px rgba(255,176,32,.36),inset 0 1px 0 rgba(255,255,255,.6);transition:.18s}",
+      "#solOk:hover{transform:translateY(-2px) scale(1.04)}",
+      "#solFoot .tip{font-size:11px;color:#9fb4dd}",
+      "#solBtn{border:1px solid rgba(79,240,255,.5);background:rgba(79,240,255,.14);color:#9ff8ff;",
+      "cursor:pointer;font-family:inherit;font-weight:800;font-size:12px;padding:9px 16px;border-radius:12px;",
+      "margin-right:8px;transition:.18s}",
+      "#solBtn:hover{background:rgba(79,240,255,.3);box-shadow:0 0 14px rgba(79,240,255,.45)}"
+    ].join("");
+    document.head.appendChild(s);
+  })();
+
+  /* ---------- 解析：这道题对应哪家公司 / 哪道情景题 ---------- */
+  /* t = 格子载荷（含精确的公司格索引 tile / 题型 kind），q = 题目对象 */
+  function companyOf(q, t) {
+    try {
+      /* 首选：格子载荷里就有精确索引 */
+      if (t && t.kind === "company" && t.tile != null) {
+        var c = vt[t.tile];
+        if (c && c.t === "company") return c;
+      }
+      if (q && q.tag === "四维透视") {
+        var i, k, nm;
+        for (i = 0; i < vt.length; i++) {
+          k = vt[i];
+          if (k && k.t === "company" && k.tell && q.tip && k.tell === q.tip) return k;
+        }
+        var txt = String((q && q.q) || "");
+        for (nm in SOL) if (txt.indexOf(nm) >= 0) {
+          for (i = 0; i < vt.length; i++) if (vt[i] && vt[i].name === nm) return vt[i];
+        }
+        if (typeof W !== "undefined" && W && W.pos) {
+          var tt = vt[W.pos[W.cur || 0]];
+          if (tt && tt.t === "company") return tt;
+        }
+      }
+    } catch (e) { }
+    return null;
+  }
+  function build(q, r, t) {
+    var tile = companyOf(q, t);
+    if (tile) {
+      var d = SOL[tile.name];
+      if (d) return { kind: "co", title: tile.name, sub: (tile.industry || "") + " · 收购价 ¥" + (tile.price || "-") + " 万", d: d };
+    }
+    var tag = (q && q.tag) || "";
+    var c = CASE[tag];
+    if (c) return { kind: "case", title: tag, sub: "反诈情景 · " + ((q && q.a) === "risk" ? "高危话术" : "正规场景"), d: c };
+    /* 兜底：题目本身也给出最小教学 */
+    var okAns = (q && q.a) === "risk" ? "report" : "invest";
+    return {
+      kind: "raw", title: tag || "情景判断", sub: "反诈情景",
+      d: {
+        a: (q && q.a) || "risk", step: "05", lights: [], score: "",
+        fix: okAns === "report" ? "应选「举报」—— 这条是高风险话术。" : "这是合规场景，可以接受。",
+        clue: String((q && q.tip) || "（暂无补充线索）"),
+        teach: "对照手册 <b>第 ⑤ 步「判结论」</b>：<i>三项以上指标互相印证才下手；出现红灯就别自欺欺人</i>。",
+        review: {
+          invest: okAns === "invest" ? "做对了 —— 这是合规场景。" : "你放行了它，但它带有明显风险特征。",
+          report: okAns === "report" ? "做对了 —— 你识别出了风险。" : "这是合规场景，举报会被判误报。",
+          pass: "你没有下结论，避开了损失，但也错过了练手的机会。"
+        }
+      }
+    };
+  }
+
+  /* ---------- 渲染 ---------- */
+  var mask = null, box = null, foot = null;
+  function ensureDom() {
+    if (mask) return;
+    mask = document.createElement("div"); mask.id = "solMask";
+    box = document.createElement("div"); box.id = "solBox";
+    mask.appendChild(box);
+    document.body.appendChild(mask);
+    mask.addEventListener("click", function (e) { if (e.target === mask) hide(); });
+  }
+  function hide() { if (mask) mask.classList.remove("on"); }
+  function show(info, r) {
+    try {
+      ensureDom();
+      var d = info.d, h = "";
+      var st = STEP[d.step] || null;
+      h += "<h3>" + info.title + " · 正确解法</h3>";
+      h += "<div class='solsub'>" + info.sub + "　|　对照《X-RAY 防骗手册》</div>";
+      h += "<div class='solsec fix'><div class='h'>① 正确解法</div><div class='b'>" + d.fix + "</div></div>";
+      h += "<div class='solsec clue'><div class='h'>② 决定性线索（代入本题数据）</div><div class='b'>" + d.clue + "</div></div>";
+      h += "<div class='solsec man'><div class='h'>③ 讲解 · 手册对照</div><div class='b'>" + d.teach + "</div>";
+      if (st) h += "<div class='sol-step'><b>手册第 " + d.step + " 步「" + st.k + "」</b><br>" + st.rule + "</div>";
+      if (d.lights && d.lights.length) {
+        h += "<div class='sol-tags'>";
+        for (var i = 0; i < d.lights.length; i++) {
+          var L = d.lights[i], txt = "";
+          if (L[1] === "red") txt = "🔴 " + (RED[L[0]] || L[0]);
+          else if (L[1] === "yellow") txt = "🟡 " + (YEL[L[0]] || L[0]);
+          else txt = "🟢 " + (GRN[L[0]] || L[0]);
+          h += "<span class='" + L[1] + "'>" + txt + "</span>";
+        }
+        h += "</div>";
+      }
+      if (d.score) h += "<div class='sol-step'>命中统计：<b>" + d.score + "</b></div>";
+      h += "</div>";
+      if (d.next && d.next.length) {
+        h += "<div class='solsec next'><div class='h'>④ 下次怎么防</div><ul class='sol-next'>";
+        for (var j = 0; j < d.next.length; j++) h += "<li>" + d.next[j] + "</li>";
+        h += "</ul></div>";
+      }
+      if (r) {
+        var act = r.act === "invest" ? "invest" : (r.act === "report" ? "report" : "pass");
+        var lead = act === "invest" ? "你认为它<b>可信</b>，选择了「投资 / 接受」" :
+                   act === "report" ? "你认为它<b>有问题</b>，选择了「举报」" :
+                                      "你<b>没有下结论</b>，选择了「放弃」";
+        var rv = (d.review && d.review[act]) ? d.review[act] : "";
+        var right = r.judgeRight;
+        h += "<div class='solsec rev'><div class='h'>⑤ 你刚才的选择　<span style='color:" +
+             (right ? "#37f5a5" : "#ff8c97") + "'>" + (right ? "判定正确" : "判定失误") + "</span></div>" +
+             "<div class='b'>" + lead + " —— " + rv + "</div></div>";
+      }
+      h += "<div id='solFoot'><button id='solOk'>确定</button>" +
+           "<span class='tip'>已对照《X-RAY 防骗手册》第 " + (d.step || "05") + " 步</span></div>";
+      box.innerHTML = h;
+      var ok = document.getElementById("solOk");
+      if (ok) ok.onclick = hide;
+      mask.classList.add("on");
+    } catch (e) {
+      try { window.__solErr = "show:" + (e && (e.stack || e.message) || e); } catch (e2) { }
+    }
+  }
+
+  /* ---------- 三档模式接线 ---------- */
+  var MODE_OVERRIDE = null;
+  function mode() { return MODE_OVERRIDE || ((typeof bc !== "undefined" && bc) ? bc : "normal"); }
+
+  var LAST = null, PENDING = null, wasOpen = false;
+
+  function onJudged(i, n, t) {
+    if (i !== 0 || !n || !t) return null;
+    var m = mode();
+    if (m === "hard") return null;
+    var info = build(n.q || (t && t.q) || null, n, t);
+    LAST = { info: info, r: n };
+    var qm = document.getElementById("quizModal");
+    if (m === "guide") {
+      if (qm && !qm.classList.contains("hidden")) { wasOpen = true; PENDING = LAST; }
+      else setTimeout(function () { show(LAST.info, LAST.r); }, 420);
+    } else ensureBtn();
+    return info;
+  }
+
+  /* rd(i, n, t) 是真正的结算入口：n = 判定结果，t = 格子载荷。
+     它在判定弹窗「还开着」的时候就被调用，时机正确 ——
+     Ar 要等玩家点「继续」才返回，那时弹窗已关，按钮无处可放。 */
+  var _rd0 = rd;
+  rd = function (i, n, t) {
+    var out = _rd0.apply(this, arguments);
+    try { onJudged(i, n, t); } catch (e) {
+      try { window.__solErr = "hook:" + (e && e.message || e); } catch (e2) { }
+    }
+    return out;
+  };
+  try {
+    window.__solDiag.wrapped = (rd !== _rd0);
+    X && (X.vt = vt);
+  } catch (e) { }
+
+  /* 普通模式：判定弹窗底部加「看解法」 */
+  function ensureBtn() {
+    try {
+      var f = document.getElementById("quizFoot");
+      if (!f) return;
+      if (document.getElementById("solBtn")) return;
+      var b = document.createElement("button");
+      b.id = "solBtn"; b.type = "button"; b.textContent = "看解法";
+      b.onclick = function () { if (LAST) show(LAST.info, LAST.r); };
+      f.insertBefore(b, f.firstChild);
+    } catch (e) { }
+  }
+  try {
+    var qf = document.getElementById("quizFoot");
+    if (qf) new MutationObserver(function () {
+      if (mode() !== "normal" || !LAST) return;
+      if (!document.getElementById("quizModal")) return;
+      if (document.getElementById("quizModal").classList.contains("hidden")) return;
+      ensureBtn();
+    }).observe(qf, { childList: true });
+  } catch (e) { }
+
+  /* 引导模式：判定弹窗关闭后强制弹教学卡 */
+  try {
+    var qm2 = document.getElementById("quizModal");
+    if (qm2) new MutationObserver(function () {
+      var hidden = qm2.classList.contains("hidden");
+      if (!hidden) { wasOpen = true; return; }
+      if (wasOpen && PENDING) {
+        wasOpen = false;
+        var p = PENDING; PENDING = null;
+        setTimeout(function () { show(p.info, p.r); }, 160);
+      }
+    }).observe(qm2, { attributes: true, attributeFilter: ["class"] });
+  } catch (e) { }
+
+  try {
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Escape") hide();
+      if ((e.key === "Enter" || e.key === " ") && mask && mask.classList.contains("on")) { hide(); }
+    });
+  } catch (e) { }
+
+  /* 调试 / 路演入口 */
+  try {
+    if (window.XRAY) {
+      window.XRAY.solution = function (nm) {
+        var d = SOL[nm] || CASE[nm];
+        if (!d) return null;
+        show({ kind: "co", title: nm, sub: "手动查看", d: d }, null);
+        return d;
+      };
+      window.XRAY.solKeys = function () { return Object.keys(SOL); };
+      window.XRAY.solTest = function (n, t) { return onJudged(0, n, t); };
+      window.XRAY.solShowLast = function () { if (!LAST) return false; show(LAST.info, LAST.r); return true; };
+      window.XRAY.solMode = function (m) { MODE_OVERRIDE = m || null; return mode(); };
+    }
+  } catch (e) {
+    try { window.__solErr = "api:" + (e && (e.stack || e.message) || e); } catch (e2) { }
+  }
+
+  try { console.log("[X-RAY-PRO] 教学卡已接线：24 家公司 + " + Object.keys(CASE).length + " 道情景题（guide 强弹 / normal 按钮 / hard 静默）"); } catch (e) { }
+})();
 </script>
 
 <style id="xray-enhance">
@@ -7748,6 +8819,7 @@ three/build/three.module.js:
 })();
 </script>
 
+<script>
 /* ===== @ xray-demo-mode 演示局（8 回合快速局） ===== */
 ;(function () {
   "use strict";
@@ -7770,6 +8842,1187 @@ three/build/three.module.js:
   } catch (e) {
     if (typeof console !== "undefined") console.warn("[xray-demo]", e);
   }
+})();
+</script>
+
+<!-- ======================================================================
+     X-RAY PRO · 视觉与动态升级层（金融全息设计语言）
+     ====================================================================== -->
+<style id="xray-pro">
+/* ---------- 0. 设计令牌 ---------- */
+:root{
+  --gold:#ffd76a; --gold2:#ffb020; --gold3:#fff6d8;
+  --cyan:#4ff0ff; --cyan2:#31c8ff;
+  --pink:#ff5fa2; --green:#37f5a5; --red:#ff5b6e;
+  --purple:#9b6bff; --violet:#8b5cff;
+  --glass:rgba(26,40,80,.60);
+  --glass2:rgba(12,20,46,.52);
+  --stroke:rgba(150,200,255,.26);
+  --txt:#eaf2ff; --sub:#9fb4dd;
+  --ease:cubic-bezier(.2,.9,.3,1.3);
+}
+@property --holoA{ syntax:"<angle>"; initial-value:0turn; inherits:false; }
+
+html,body{ -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility; }
+body{ letter-spacing:.2px; }
+*{ scrollbar-width:thin; scrollbar-color:rgba(120,180,255,.4) transparent; }
+::-webkit-scrollbar{ width:6px; height:6px; }
+::-webkit-scrollbar-track{ background:transparent; }
+::-webkit-scrollbar-thumb{ background:linear-gradient(180deg,rgba(79,240,255,.45),rgba(120,160,255,.3)); border-radius:99px; }
+::-webkit-scrollbar-thumb:hover{ background:rgba(79,240,255,.6); }
+
+/* ---------- 1. 电影质感覆盖层 ---------- */
+#fxAurora{ position:fixed; inset:0; z-index:1; pointer-events:none; opacity:.62; }
+#fxAurora b{ position:absolute; display:block; border-radius:50%; }
+#fxAurora b:nth-child(1){ width:86vw; height:86vw; left:-30vw; top:-42vh;
+  background:radial-gradient(circle,rgba(47,107,255,.20) 0%,rgba(47,107,255,.07) 38%,transparent 70%);
+  animation:fxDrift1 30s ease-in-out infinite; }
+#fxAurora b:nth-child(2){ width:70vw; height:70vw; right:-26vw; top:18vh;
+  background:radial-gradient(circle,rgba(255,176,32,.11) 0%,rgba(255,176,32,.04) 38%,transparent 70%);
+  animation:fxDrift2 36s ease-in-out infinite; }
+#fxAurora b:nth-child(3){ width:72vw; height:72vw; left:14vw; bottom:-40vh;
+  background:radial-gradient(circle,rgba(139,92,255,.15) 0%,rgba(139,92,255,.05) 38%,transparent 70%);
+  animation:fxDrift3 43s ease-in-out infinite; }
+@keyframes fxDrift1{ 0%,100%{transform:translate(0,0) scale(1)} 50%{transform:translate(6vw,8vh) scale(1.18)} }
+@keyframes fxDrift2{ 0%,100%{transform:translate(0,0) scale(1.1)} 50%{transform:translate(-8vw,-6vh) scale(.9)} }
+@keyframes fxDrift3{ 0%,100%{transform:translate(0,0) scale(.95)} 50%{transform:translate(5vw,-9vh) scale(1.2)} }
+
+#fxGrain{ position:fixed; inset:-25%; z-index:2; pointer-events:none; opacity:.045;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)'/%3E%3C/svg%3E");
+  animation:fxGrain 1s steps(4) infinite; }
+@keyframes fxGrain{ 0%{transform:translate(0,0)} 25%{transform:translate(-2%,1%)} 50%{transform:translate(1%,-2%)} 75%{transform:translate(2%,2%)} 100%{transform:translate(0,0)} }
+
+#fxLines{ position:fixed; inset:0; z-index:2; pointer-events:none; opacity:.18;
+  background:repeating-linear-gradient(180deg,rgba(140,200,255,.06) 0 1px,transparent 1px 3px); }
+#fxLines::after{ content:""; position:absolute; left:0; right:0; height:20vh;
+  background:linear-gradient(180deg,transparent,rgba(79,240,255,.045),transparent);
+  animation:fxSweep 11s linear infinite; }
+@keyframes fxSweep{ 0%{top:-24vh} 100%{top:104vh} }
+
+/* 全息 HUD 边角框 */
+#fxFrame{ position:fixed; inset:12px; z-index:3; pointer-events:none; opacity:.34; }
+#fxFrame i{ position:absolute; width:22px; height:22px; border:1px solid rgba(130,225,255,.75); }
+#fxFrame i:nth-child(1){ left:0; top:0; border-right:0; border-bottom:0; }
+#fxFrame i:nth-child(2){ right:0; top:0; border-left:0; border-bottom:0; }
+#fxFrame i:nth-child(3){ left:0; bottom:0; border-right:0; border-top:0; }
+#fxFrame i:nth-child(4){ right:0; bottom:0; border-left:0; border-top:0; }
+#fxFrame u{ position:absolute; left:50%; transform:translateX(-50%); height:1px; width:18%;
+  background:linear-gradient(90deg,transparent,rgba(130,225,255,.6),transparent); }
+#fxFrame u:nth-child(5){ top:0 } #fxFrame u:nth-child(6){ bottom:0 }
+#fxFrame{ animation:fxFrameBreathe 6s ease-in-out infinite; }
+@keyframes fxFrameBreathe{ 0%,100%{opacity:.20} 50%{opacity:.42} }
+
+/* ---------- 2. 玻璃面板升级 ---------- */
+.glass{
+  background:
+    linear-gradient(158deg,rgba(34,50,100,.66),rgba(9,14,34,.74)),
+    radial-gradient(120% 90% at 0% 0%,rgba(79,240,255,.10),transparent 62%),
+    radial-gradient(100% 80% at 100% 100%,rgba(255,176,32,.08),transparent 62%) !important;
+  border:1px solid rgba(150,200,255,.24) !important;
+  border-radius:18px;
+  backdrop-filter:blur(18px) saturate(150%) brightness(1.06);
+  -webkit-backdrop-filter:blur(18px) saturate(150%) brightness(1.06);
+  box-shadow:
+    0 20px 50px -16px rgba(0,0,0,.75),
+    inset 0 1px 0 rgba(255,255,255,.14),
+    inset 0 -1px 0 rgba(0,0,0,.22) !important;
+}
+/* 顶部高光描边（不占用伪元素，避免与已有动画冲突） */
+#topbar,#bottomBar,.sect,.pcard,#miniWrap,#dirPad{
+  box-shadow:
+    0 20px 50px -16px rgba(0,0,0,.75),
+    inset 0 1px 0 rgba(255,255,255,.16),
+    inset 0 -1px 0 rgba(0,0,0,.22),
+    0 0 0 1px rgba(255,255,255,.03);
+}
+
+/* ---------- 3. 顶栏 ---------- */
+#topbar{ padding:7px 14px; gap:12px; }
+.logo{ font-size:18px; letter-spacing:1px;
+  background:linear-gradient(92deg,#fff6d0,#ffd76a 38%,#4ff0ff 72%,#ff8ec7);
+  background-size:220% 100%;
+  -webkit-background-clip:text; background-clip:text; color:transparent;
+  text-shadow:0 0 26px rgba(255,215,106,.30);
+  animation:logoShimmer 7s linear infinite; }
+@keyframes logoShimmer{ 0%{background-position:0% 50%} 100%{background-position:220% 50%} }
+.logo small{ letter-spacing:3px; opacity:.85; }
+.chip{ background:linear-gradient(180deg,rgba(255,255,255,.09),rgba(255,255,255,.04));
+  border:1px solid rgba(255,255,255,.15);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.12); }
+.chip b{ text-shadow:0 0 12px rgba(255,215,106,.45); }
+#phaseText{ color:#9ff8ff; text-shadow:0 0 14px rgba(79,240,255,.35); }
+
+.roundline b{ text-shadow:0 0 14px rgba(255,215,106,.5); }
+.progress{ height:8px; gap:3px; border-radius:5px; overflow:visible; }
+.progress i{ border-radius:3px; background:rgba(255,255,255,.13); }
+.progress i.done{ background:linear-gradient(90deg,#fff3c4,#ffb020);
+  box-shadow:0 0 10px rgba(255,176,32,.45); }
+.progress i.now{ background:linear-gradient(90deg,#bffbff,#31c8ff);
+  box-shadow:0 0 14px rgba(79,240,255,.9); transform:scaleY(1.7); position:relative; }
+.progress i.now::after{ content:""; position:absolute; inset:0; border-radius:3px;
+  background:linear-gradient(100deg,transparent,rgba(255,255,255,.85),transparent);
+  animation:progShimmer 1.6s linear infinite; }
+@keyframes progShimmer{ 0%{transform:translateX(-120%)} 100%{transform:translateX(120%)} }
+
+.iconbtn{ border-radius:10px; background:linear-gradient(180deg,rgba(255,255,255,.12),rgba(255,255,255,.05)); }
+.iconbtn:hover{ background:linear-gradient(180deg,rgba(79,240,255,.35),rgba(79,240,255,.15));
+  box-shadow:0 0 14px rgba(79,240,255,.4); transform:translateY(-1px) scale(1.06); }
+
+/* ---------- 4. 提示条 ---------- */
+#hintBar{ font-size:13px; padding:9px 18px;
+  background:linear-gradient(160deg,rgba(30,46,92,.80),rgba(10,16,38,.78));
+  box-shadow:0 16px 42px -14px rgba(0,0,0,.75), inset 0 1px 0 rgba(255,255,255,.14); }
+#hintBar b{ color:var(--gold); text-shadow:0 0 12px rgba(255,215,106,.4); }
+#hintBar.pulse{ animation:hintPulse 1.8s ease-in-out infinite; }
+
+/* ---------- 5. 玩家卡片 ---------- */
+#playersPanel{ gap:7px; }
+.pcard{ padding:8px 10px; border-radius:14px;
+  background:linear-gradient(150deg,rgba(30,45,90,.62),rgba(10,16,38,.66));
+  border:1px solid rgba(150,200,255,.14); }
+.pcard .dot{ box-shadow:0 0 14px currentColor, 0 0 4px #fff inset; }
+.pav{ border-radius:10px; box-shadow:0 4px 12px rgba(0,0,0,.5), inset 0 1px 0 rgba(255,255,255,.6); }
+.pnet{ text-shadow:0 0 14px rgba(255,255,255,.18); }
+.pcard.active{
+  border-color:rgba(255,215,106,.85);
+  transform:translateX(7px) scale(1.035);
+  background:linear-gradient(150deg,rgba(70,58,30,.7),rgba(24,20,44,.7));
+  box-shadow:0 0 0 1px rgba(255,215,106,.5), 0 10px 34px rgba(255,180,32,.26),
+             inset 0 1px 0 rgba(255,255,255,.18);
+}
+.pcard.active::after{ background:linear-gradient(100deg,transparent,rgba(255,215,106,.22),transparent); }
+.pcard.dead{ filter:grayscale(1) brightness(.75); }
+.owns i{ box-shadow:0 0 6px currentColor; }
+
+/* ---------- 6. 右侧信息 ---------- */
+#rightPanel{ gap:11px; }
+.sect{ padding:12px 14px; border-radius:17px;
+  background:linear-gradient(158deg,rgba(32,48,96,.62),rgba(9,14,34,.72));
+  border:1px solid rgba(150,200,255,.16); }
+.sect h4{ font-size:10.5px; letter-spacing:2.5px; opacity:.85; }
+.asset{ border-radius:12px; background:linear-gradient(180deg,rgba(255,255,255,.07),rgba(255,255,255,.03));
+  border:1px solid rgba(255,255,255,.10); }
+.asset b{ font-size:15px; text-shadow:0 0 14px rgba(255,255,255,.22); }
+#tileCard .tname{ font-size:16px; letter-spacing:.4px; }
+.minix span{ border-radius:9px; background:linear-gradient(180deg,rgba(255,255,255,.08),rgba(255,255,255,.03)); }
+#logBox{ gap:4px; }
+.log{ padding:2px 0 2px 9px; }
+.log::before{ width:4px; height:4px; box-shadow:0 0 8px currentColor; }
+
+/* ---------- 7. 迷你地图 ---------- */
+#miniWrap{ border-radius:17px; padding:9px 11px; }
+#miniMap{ gap:3px; }
+#miniMap .mc{ border-radius:4px; background:rgba(255,255,255,.05);
+  border:1px solid rgba(255,255,255,.08); transition:transform .2s var(--ease), box-shadow .25s, background .25s; }
+#miniMap .mc:hover{ transform:scale(1.22); z-index:3; box-shadow:0 0 0 2px rgba(159,248,255,.8) inset; }
+#miniMap .mc.here{ box-shadow:0 0 0 2px rgba(255,215,106,.95) inset, 0 0 16px rgba(255,215,106,.55);
+  animation:mcPulse 1.6s ease-in-out infinite; }
+@keyframes mcPulse{ 0%,100%{filter:brightness(1)} 50%{filter:brightness(1.5)} }
+#miniMap .mc .pw{ box-shadow:0 0 9px currentColor; }
+#miniMap .mc .tp{ animation:mcPulse 1.1s ease-in-out infinite; }
+.miniLegend .lg{ letter-spacing:.4px; }
+
+/* ---------- 8. 方向盘 ---------- */
+#dirPad{ border-radius:18px; padding:11px 15px;
+  background:linear-gradient(165deg,rgba(20,34,72,.94),rgba(8,14,34,.94));
+  border:1px solid rgba(120,200,255,.38);
+  box-shadow:0 16px 44px -12px rgba(0,0,0,.7), 0 0 0 1px rgba(255,255,255,.05) inset; }
+.dp{ border-radius:13px; transition:.16s var(--ease); }
+.dp:hover:not(:disabled){ background:rgba(79,240,255,.32); box-shadow:0 0 16px rgba(79,240,255,.5); transform:translateY(-2px) scale(1.06); }
+.dp.on{ box-shadow:0 0 18px rgba(79,240,255,.95); background:rgba(79,240,255,.32); }
+
+/* ---------- 9. 底部栏 & 按钮 ---------- */
+#bottomBar{ padding:11px 15px; gap:11px; border-radius:22px; }
+.btn{ border-radius:14px; letter-spacing:.8px; overflow:hidden;
+  transition:transform .18s var(--ease), box-shadow .18s, filter .18s; }
+.btn::after{ content:""; position:absolute; inset:0; pointer-events:none;
+  background:linear-gradient(105deg,transparent 32%,rgba(255,255,255,.6) 48%,transparent 64%);
+  transform:translateX(-130%); transition:transform .6s cubic-bezier(.25,.8,.3,1); }
+.btn:hover:not(:disabled)::after{ transform:translateX(130%); }
+.btn:hover:not(:disabled){ transform:translateY(-2px) scale(1.045);
+  box-shadow:0 10px 26px rgba(255,176,32,.42), inset 0 1px 0 rgba(255,255,255,.7); }
+.btn:active:not(:disabled){ transform:translateY(1px) scale(.975); }
+.btn.ghost:hover:not(:disabled){ box-shadow:0 8px 22px rgba(60,140,255,.3), inset 0 1px 0 rgba(255,255,255,.2); }
+.btn.cyan:hover:not(:disabled){ box-shadow:0 10px 26px rgba(60,200,255,.46), inset 0 1px 0 rgba(255,255,255,.7); }
+.btn.pink:hover:not(:disabled){ box-shadow:0 10px 26px rgba(255,80,150,.46), inset 0 1px 0 rgba(255,255,255,.6); }
+.btn:disabled{ filter:grayscale(.75) brightness(.7); }
+.ripple{ position:absolute; border-radius:50%; transform:scale(0); pointer-events:none;
+  background:radial-gradient(circle,rgba(255,255,255,.65),rgba(255,255,255,0) 70%);
+  animation:ripple .55s ease-out forwards; }
+@keyframes ripple{ to{ transform:scale(2.6); opacity:0; } }
+
+/* ---------- 10. 骰子 ---------- */
+.die{ width:36px; height:36px; border-radius:11px; font-size:18px;
+  background:linear-gradient(150deg,#fffaf0,#ffd070 55%,#f0a93c);
+  box-shadow:0 6px 16px rgba(255,176,32,.45), inset 0 2px 0 rgba(255,255,255,.85), inset 0 -3px 6px rgba(160,90,0,.28);
+  text-shadow:0 1px 0 rgba(255,255,255,.6); }
+.die.roll{ animation:diePop .5s cubic-bezier(.16,1.1,.3,1); }
+@keyframes diePop{
+  0%{ transform:scale(.35) rotate(-40deg); filter:blur(2px) brightness(1.5); }
+  55%{ transform:scale(1.2) rotate(14deg); filter:blur(0) brightness(1.25); }
+  78%{ transform:scale(.94) rotate(-5deg); }
+  100%{ transform:scale(1) rotate(0deg); filter:none; }
+}
+
+/* ---------- 11. 弹窗 ---------- */
+.modal{ background:radial-gradient(circle at 50% 38%,rgba(12,24,58,.62),rgba(2,4,12,.90));
+  backdrop-filter:blur(10px) saturate(120%); -webkit-backdrop-filter:blur(10px) saturate(120%); }
+.card{ border-radius:26px; overflow:visible; isolation:isolate;
+  background:linear-gradient(165deg,rgba(34,52,104,.94),rgba(9,14,34,.96));
+  border:1px solid rgba(150,200,255,.30);
+  box-shadow:0 40px 110px -20px rgba(0,0,0,.75), inset 0 1px 0 rgba(255,255,255,.18);
+  animation:cardIn .5s cubic-bezier(.16,1.1,.3,1); }
+.card::before{ content:""; position:absolute; inset:0; border-radius:26px; pointer-events:none; z-index:-1;
+  background:
+    radial-gradient(60% 40% at 12% 0%,rgba(79,240,255,.20),transparent 70%),
+    radial-gradient(55% 40% at 92% 8%,rgba(255,176,32,.16),transparent 70%),
+    radial-gradient(70% 45% at 50% 110%,rgba(139,92,255,.20),transparent 70%);
+  animation:cardAurora 12s ease-in-out infinite alternate; }
+@keyframes cardAurora{ 0%{filter:hue-rotate(0deg) brightness(1)} 100%{filter:hue-rotate(28deg) brightness(1.18)} }
+@keyframes cardIn{ from{ opacity:0; transform:translateY(30px) scale(.93); filter:blur(6px); }
+                   to{ opacity:1; transform:none; filter:none; } }
+/* 旋转全息描边 */
+.modal .card::after{ content:""; position:absolute; inset:0; border-radius:26px; padding:1px; pointer-events:none;
+  background:conic-gradient(from var(--holoA,0turn),
+    transparent 0 56%, rgba(79,240,255,.95) 68%, rgba(255,215,106,.95) 80%, transparent 92%);
+  -webkit-mask:linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask:linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite:xor; mask-composite:exclude;
+  animation:holoSpin 4.5s linear infinite; }
+@keyframes holoSpin{ to{ --holoA:1turn; } }
+
+.card h2{ font-size:23px; }
+.badge{ box-shadow:0 0 16px rgba(79,240,255,.28); }
+.scenario{ border-radius:16px; box-shadow:inset 0 1px 0 rgba(255,255,255,.1); }
+.opts{ gap:11px; }
+.opt{ border-radius:17px; transition:.22s var(--ease); }
+.opt:hover{ transform:translateY(-4px) scale(1.02);
+  box-shadow:0 14px 30px -10px rgba(0,0,0,.6), inset 0 1px 0 rgba(255,255,255,.18); }
+.opt.safe:hover{ box-shadow:0 0 0 1px rgba(55,245,165,.7), 0 14px 30px -10px rgba(55,245,165,.4); }
+.opt.risk:hover{ box-shadow:0 0 0 1px rgba(255,91,110,.7), 0 14px 30px -10px rgba(255,91,110,.4); }
+.metric{ border-radius:14px; }
+.meter i{ box-shadow:0 0 10px rgba(79,240,255,.6); }
+.qhint{ box-shadow:0 0 24px -6px rgba(79,240,255,.35); }
+
+/* ---------- 12. 开始页 ---------- */
+#startCard h1{ font-size:44px;
+  background:linear-gradient(100deg,#fff6d0,#ffd76a 30%,#4ff0ff 62%,#ff8ec7 88%,#fff6d0);
+  background-size:260% 100%;
+  -webkit-background-clip:text; background-clip:text; color:transparent;
+  filter:drop-shadow(0 0 30px rgba(255,215,106,.34));
+  animation:logoShimmer 6s linear infinite; }
+#startCard .slogan{ letter-spacing:5px; margin:10px 0 20px; }
+.rules{ border-radius:16px; box-shadow:inset 0 1px 0 rgba(255,255,255,.1); }
+.mode-card{ border-radius:15px; transition:.22s var(--ease); position:relative; overflow:hidden; }
+.mode-card::after{ content:""; position:absolute; inset:0; pointer-events:none;
+  background:radial-gradient(120% 80% at 50% 120%,rgba(255,215,106,.25),transparent 70%);
+  opacity:0; transition:opacity .25s; }
+.mode-card:hover{ transform:translateY(-4px) scale(1.03);
+  box-shadow:0 16px 34px -12px rgba(0,0,0,.65), inset 0 1px 0 rgba(255,255,255,.2); }
+.mode-card:hover::after{ opacity:1; }
+.mode-card.selected{ box-shadow:0 0 0 1px var(--gold) inset, 0 14px 30px rgba(255,200,80,.28), 0 0 30px rgba(255,215,106,.2); }
+
+/* ---------- 13. 终局 ---------- */
+.rk{ border-radius:15px; transition:.22s var(--ease); }
+.rk:hover{ transform:translateX(4px); }
+.rk.first{ box-shadow:0 0 0 1px rgba(255,215,106,.45), 0 10px 30px -10px rgba(255,176,32,.45); }
+.rk .no{ border-radius:9px; box-shadow:inset 0 1px 0 rgba(255,255,255,.2); }
+.endstats{ box-shadow:inset 0 1px 0 rgba(255,255,255,.12), 0 0 30px -12px rgba(79,240,255,.5); }
+#endStats .es-b b{ color:#9ff8ff; text-shadow:0 0 12px rgba(79,240,255,.4); }
+
+/* ---------- 14. 大事件横幅 ---------- */
+#banner{ font-size:46px; letter-spacing:6px; }
+#banner.show::before{ content:""; position:absolute; left:50%; top:50%;
+  width:min(92vw,1200px); height:210%; transform:translate(-50%,-50%); z-index:-1;
+  background:radial-gradient(ellipse at center,rgba(4,8,22,.78),rgba(4,8,22,.35) 55%,transparent 76%);
+  filter:blur(4px); }
+#banner.show::after{ content:""; position:absolute; left:50%; top:50%;
+  width:130px; height:130px; margin:-65px 0 0 -65px; border-radius:50%;
+  border:2px solid rgba(255,215,106,.7); pointer-events:none;
+  animation:bannerRing 1.15s cubic-bezier(.2,.8,.3,1) forwards; }
+@keyframes bannerRing{ 0%{ transform:scale(.15); opacity:.95; } 100%{ transform:scale(3.6); opacity:0; } }
+
+/* ---------- 15. 3D 飘字 ---------- */
+.float{ font-size:21px; letter-spacing:.5px;
+  -webkit-text-stroke:1px rgba(0,0,0,.35);
+  text-shadow:0 2px 10px rgba(0,0,0,.85), 0 0 22px currentColor; }
+
+/* ---------- 16. 提示气泡 ---------- */
+#tip{ border-radius:13px; background:linear-gradient(160deg,rgba(14,24,54,.94),rgba(6,10,26,.94));
+  border:1px solid rgba(150,210,255,.42); box-shadow:0 14px 36px rgba(0,0,0,.6), 0 0 24px -8px rgba(79,240,255,.5);
+  backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px); }
+
+/* ---------- 17. 视角提示 / 触控 ---------- */
+#roamHint,#viewHint{ opacity:.5; border-radius:15px;
+  background:linear-gradient(160deg,rgba(12,22,50,.86),rgba(6,10,26,.86));
+  box-shadow:0 12px 34px rgba(0,0,0,.5), 0 0 22px -8px rgba(79,240,255,.45); }
+#roamHint:hover,#viewHint:hover{ opacity:1; transform:translateX(-50%) scale(1.04); }
+
+/* ---------- 18. 加载页 ---------- */
+#loading{ background:radial-gradient(circle at 50% 42%,#131f47,#04060f 72%); }
+#loading .ring{ width:74px; height:74px; border-width:3px;
+  box-shadow:0 0 30px rgba(255,215,106,.35), inset 0 0 18px rgba(79,240,255,.25); }
+#loading p{ letter-spacing:5px; opacity:.9; position:relative; }
+/* 首屏卡顿兜底提示：纯 CSS + 合成层动画，主线程被 three.js 阻塞时也能浮现 */
+#loading p::after{
+  content:"长时间没有画面？① 确认浏览器已开启硬件加速　② 改用最新版 Chrome / Edge　③ 可直接双击本文件离线打开";
+  position:absolute; left:50%; top:30px; transform:translateX(-50%);
+  width:max-content; max-width:78vw; text-align:center;
+  font-size:11px; line-height:2; color:#93a9cf; letter-spacing:.5px;
+  opacity:0; will-change:opacity; animation:bootTip .7s 7s ease forwards;
+}
+@keyframes bootTip{ to{ opacity:1 } }
+#loading .ld::after{ content:""; display:block; width:190px; height:3px; margin:18px auto 0;
+  border-radius:3px; background:rgba(255,255,255,.12); overflow:hidden; position:relative; }
+#loading .ld{ position:relative; }
+#loading .ld::before{ content:""; position:absolute; left:50%; bottom:-3px; width:186px; height:3px;
+  transform:translateX(-50%); border-radius:3px; z-index:2;
+  background:linear-gradient(90deg,#4ff0ff,#ffd76a);
+  animation:ldBar 1.6s ease-in-out infinite; }
+@keyframes ldBar{ 0%{width:10px;opacity:.4} 50%{width:186px;opacity:1} 100%{width:10px;opacity:.4} }
+
+/* ---------- 19. 模式主题（只染 HUD 边角，不动品牌金） ---------- */
+html[data-mode="hard"]  #fxFrame i{ border-color:rgba(255,140,160,.8) }
+html[data-mode="guide"] #fxFrame i{ border-color:rgba(150,240,255,.85) }
+html[data-mode="demo"]  #fxFrame i{ border-color:rgba(255,215,106,.85) }
+
+/* ---------- 21. v3：即时反馈 ---------- */
+.modal{ animation:modalFade .28s ease both; }
+@keyframes modalFade{ from{opacity:0} to{opacity:1} }
+#dirPad{ animation:dpIn .32s cubic-bezier(.2,.9,.3,1.5) both; }
+@keyframes dpIn{ from{opacity:0;transform:translateX(-50%) translateY(16px) scale(.9)}
+                 to{opacity:1;transform:translateX(-50%) translateY(0) scale(1)} }
+#hintBar.pulse #hintIcon{ display:inline-block; animation:hintIconPop 2.4s ease-in-out infinite; }
+@keyframes hintIconPop{ 0%,100%{transform:scale(1) rotate(0)} 50%{transform:scale(1.24) rotate(-9deg)} }
+/* 终局彩带 */
+#confetti{ position:fixed; inset:0; z-index:28; pointer-events:none; overflow:hidden; }
+#confetti i{ position:absolute; top:-30px; border-radius:2px; opacity:.95; animation:confFall linear forwards; }
+@keyframes confFall{ 0%{transform:translateY(-8vh) rotate(0)} 100%{transform:translateY(114vh) rotate(760deg)} }
+/* 飘字（3D→屏幕）更醒目 */
+.float{ font-size:21px; letter-spacing:.5px; -webkit-text-stroke:1px rgba(0,0,0,.4);
+  text-shadow:0 2px 10px rgba(0,0,0,.9), 0 0 26px currentColor; }
+
+/* ---------- 20. 降级 / 无障碍 / 响应式 ---------- */
+html.modal-open #fxFrame{ opacity:.10 !important }
+html.lowfx #fxGrain, html.lowfx #fxAurora, html.lowfx #fxLines{ display:none !important; }
+html.lowfx .card::before, html.lowfx .modal .card::after, html.lowfx #banner.show::after{ animation:none; }
+html.lowfx #fxFrame{ animation:none; opacity:.22; }
+
+@media (prefers-reduced-motion:reduce){
+  #fxGrain,#fxAurora,#fxLines,#fxFrame,.logo,.card::before,.modal .card::after{ animation:none !important; }
+  #fxAurora{ opacity:.25; }
+}
+
+@media (max-width:1280px){
+  #playersPanel{ width:196px } #rightPanel{ width:232px } #miniWrap{ width:190px }
+}
+@media (max-width:1180px){
+  #playersPanel{ width:172px } #rightPanel{ width:210px } #miniWrap{ width:176px }
+}
+@media (max-width:980px){
+  #playersPanel{ width:152px } #rightPanel{ width:192px } #miniWrap{ width:158px }
+  #fxFrame{ display:none } #logBox{ max-height:110px }
+}
+@media (max-width:760px){
+  #fxAurora{ display:none } #banner{ font-size:32px; letter-spacing:3px }
+  #topbar{ gap:8px; padding:6px 10px } .logo{ font-size:15px }
+}
+@media (max-height:700px){
+  #miniWrap{ bottom:78px } .miniLegend{ display:none } #logBox{ max-height:96px }
+}
+</style>
+
+<script id="xray-pro-js">
+/* ================= X-RAY PRO · DOM 动态层 ================= */
+(function () {
+  "use strict";
+  var D = document, ROOT = D.documentElement;
+
+  /* ---------- 1. 注入电影质感覆盖层 ---------- */
+  function layer(id, tag, n) {
+    if (D.getElementById(id)) return D.getElementById(id);
+    var el = D.createElement(tag || "div");
+    el.id = id;
+    if (n) for (var i = 0; i < n; i++) el.appendChild(D.createElement(tag === "div" ? "b" : "i"));
+    D.body.appendChild(el);
+    return el;
+  }
+  try {
+    var au = layer("fxAurora", "div", 3);
+    layer("fxGrain");
+    layer("fxLines");
+    var fr = layer("fxFrame", "div", 0);
+    for (var i = 0; i < 6; i++) fr.appendChild(D.createElement(i < 4 ? "i" : "u"));
+  } catch (e) { }
+
+  /* ---------- 2. 数字滚动（面板整体重绘也能平滑过渡） ---------- */
+  var NUM_RE = /-?\d+(?:\.\d+)?/;
+  function parts(s) {
+    var m = String(s).match(NUM_RE);
+    if (!m) return null;
+    var dec = (m[0].split(".")[1] || "").length;
+    return { pre: s.slice(0, m.index), suf: s.slice(m.index + m[0].length), dec: dec, num: parseFloat(m[0]) };
+  }
+  var store = {};
+  function tweenNums(root) {
+    if (!root || !root.id) return;
+    var nodes = [];
+    try {
+      nodes = Array.prototype.slice.call(root.querySelectorAll(".pnet,.cash,.asset b,.es-b b,.rv,#roundNum"));
+    } catch (e) { return; }
+    var key = root.id;
+    if (!store[key]) store[key] = [];
+    var bucket = store[key];
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      if (el.__tweening) continue;
+      var txt = (el.textContent || "").trim();
+      var np = parts(txt);
+      if (!np) continue;
+      var prev = bucket[i];
+      var old = (prev && prev.pre === np.pre && prev.suf === np.suf && typeof prev.num === "number") ? prev.num : null;
+      bucket[i] = { pre: np.pre, suf: np.suf, num: np.num };
+      if (old === null || Math.abs(old - np.num) < 0.05) continue;
+      (function (el, from, to, pre, suf, dec) {
+        el.__tweening = true;
+        var t0 = performance.now(), dur = 520;
+        function step(now) {
+          var p = Math.min(1, (now - t0) / dur);
+          p = 1 - Math.pow(1 - p, 3);
+          var v = from + (to - from) * p;
+          el.textContent = pre + v.toFixed(dec) + suf;
+          if (p < 1) requestAnimationFrame(step);
+          else { el.textContent = pre + to.toFixed(dec) + suf; el.__tweening = false; }
+        }
+        requestAnimationFrame(step);
+      })(el, old, np.num, np.pre, np.suf, np.dec);
+    }
+  }
+  try {
+    var mo = new MutationObserver(function (muts) {
+      for (var i = 0; i < muts.length; i++) {
+        var t = muts[i].target;
+        if (t.id === "playersPanel" || t.id === "myAssets" || t.id === "endStats" || t.id === "topbar") tweenNums(t);
+      }
+    });
+    ["playersPanel", "myAssets", "endStats", "topbar"].forEach(function (id) {
+      var el = D.getElementById(id);
+      if (el) mo.observe(el, { childList: true, subtree: true, characterData: true });
+    });
+  } catch (e) { }
+
+  /* ---------- 3. 按钮水波纹 ---------- */
+  try {
+    D.addEventListener("pointerdown", function (e) {
+      var b = e.target && e.target.closest ? e.target.closest(".btn,.iconbtn,.dp,.opt,.mode-card") : null;
+      if (!b) return;
+      var r = b.getBoundingClientRect();
+      var s = Math.max(r.width, r.height) * 1.1;
+      var sp = D.createElement("span");
+      sp.className = "ripple";
+      sp.style.width = sp.style.height = s + "px";
+      sp.style.left = (e.clientX - r.left - s / 2) + "px";
+      sp.style.top = (e.clientY - r.top - s / 2) + "px";
+      if (getComputedStyle(b).position === "static") b.style.position = "relative";
+      b.appendChild(sp);
+      setTimeout(function () { if (sp.parentNode) sp.parentNode.removeChild(sp); }, 620);
+    }, { passive: true });
+  } catch (e) { }
+
+  /* ---------- 4. 面板入场（首次出现时错峰淡入） ---------- */
+  try {
+    var enter = D.createElement("style");
+    enter.textContent =
+      ".xp-in{opacity:0;transform:translateY(10px) scale(.985)}" +
+      "#playersPanel,#rightPanel,#miniWrap,#bottomBar,#topbar{transition:opacity .5s ease,transform .5s cubic-bezier(.2,.9,.3,1.3)}";
+    D.head.appendChild(enter);
+    ["playersPanel", "rightPanel", "miniWrap", "bottomBar", "topbar"].forEach(function (id, k) {
+      var el = D.getElementById(id);
+      if (!el) return;
+      el.classList.add("xp-in");
+      setTimeout(function () { el.classList.remove("xp-in"); }, 260 + k * 110);
+    });
+  } catch (e) { }
+
+  /* ---------- 5. 模式卡片 3D 倾斜 ---------- */
+  try {
+    D.addEventListener("pointermove", function (e) {
+      var c = e.target && e.target.closest ? e.target.closest(".mode-card") : null;
+      if (!c) return;
+      var r = c.getBoundingClientRect();
+      var dx = (e.clientX - r.left) / r.width - 0.5, dy = (e.clientY - r.top) / r.height - 0.5;
+      c.style.transform = "perspective(600px) rotateY(" + (dx * 9).toFixed(2) + "deg) rotateX(" + (-dy * 9).toFixed(2) + "deg) translateY(-3px)";
+    }, { passive: true });
+    D.addEventListener("pointerout", function (e) {
+      var c = e.target && e.target.closest ? e.target.closest(".mode-card") : null;
+      if (c) c.style.transform = "";
+    }, { passive: true });
+  } catch (e) { }
+
+  /* ---------- 6. 弹窗打开时强化背景虚化 + 入场 ---------- */
+  try {
+    ["startModal", "quizModal", "endModal"].forEach(function (id) {
+      var m = D.getElementById(id);
+      if (!m) return;
+      new MutationObserver(function () {
+        ROOT.classList.toggle("modal-open", !m.classList.contains("hidden"));
+      }).observe(m, { attributes: true, attributeFilter: ["class"] });
+    });
+  } catch (e) { }
+
+  /* ---------- 7. 快捷键提示：Shift+/ 显示操作说明 ---------- */
+  try {
+    D.addEventListener("keydown", function (e) {
+      if (e.key === "?" || (e.shiftKey && e.key === "/")) {
+        var t = D.getElementById("xpKeys");
+        if (t) { t.classList.toggle("hidden"); return; }
+        t = D.createElement("div");
+        t.id = "xpKeys";
+        t.className = "glass";
+        t.style.cssText = "position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:80;padding:18px 22px;border-radius:18px;font-size:12.5px;line-height:2;color:#dce8ff";
+        t.innerHTML = "<b style='color:#ffd76a;font-size:14px'>操作快捷键</b><br>" +
+          "<kbd>空格</kbd> 掷骰子　<kbd>W A S D</kbd> / 方向键 选路<br>" +
+          "<kbd>1 2 3</kbd> 选择判定　<kbd>V</kbd> 漫游　<kbd>F</kbd> 跟随<br>" +
+          "<kbd>Q</kbd> / <kbd>E</kbd> 收起左 / 右栏　<kbd>H</kbd> 防骗手册<br>" +
+          "<span style='opacity:.7'>再次按 ? 关闭</span>";
+        D.body.appendChild(t);
+      }
+      if (e.key === "Escape") { var t2 = D.getElementById("xpKeys"); if (t2) t2.remove(); }
+    });
+    var kb = D.createElement("style");
+    kb.textContent = "#xpKeys kbd{background:rgba(255,255,255,.14);border-radius:5px;padding:1px 6px;font-family:inherit;font-weight:800;margin-right:2px}";
+    D.head.appendChild(kb);
+  } catch (e) { }
+
+  /* ---------- 8. 开局前隐藏 HUD 边角框，进入游戏后显示 ---------- */
+  try {
+    var st = D.createElement("style");
+    st.textContent = "html:not(.in-game) #fxFrame{opacity:.12 !important}";
+    D.head.appendChild(st);
+  } catch (e) { }
+
+  /* ---------- 9. 终局彩带 ---------- */
+  try {
+    var em = D.getElementById("endModal");
+    if (em) {
+      new MutationObserver(function () {
+        if (em.classList.contains("hidden")) return;
+        var box = D.getElementById("confetti");
+        if (!box) { box = D.createElement("div"); box.id = "confetti"; D.body.appendChild(box); }
+        box.innerHTML = "";
+        var cs = ["#ffd76a", "#4ff0ff", "#ff5fa2", "#37f5a5", "#8b5cff"];
+        for (var i = 0; i < 72; i++) {
+          var el = D.createElement("i");
+          el.style.left = (Math.random() * 100).toFixed(2) + "vw";
+          el.style.width = (5 + Math.random() * 6).toFixed(1) + "px";
+          el.style.height = (9 + Math.random() * 12).toFixed(1) + "px";
+          el.style.background = cs[(Math.random() * cs.length) | 0];
+          el.style.animationDuration = (2.2 + Math.random() * 2.3).toFixed(2) + "s";
+          el.style.animationDelay = (Math.random() * 1.7).toFixed(2) + "s";
+          el.style.opacity = (0.75 + Math.random() * 0.25).toFixed(2);
+          box.appendChild(el);
+        }
+        setTimeout(function () { if (box.parentNode) box.parentNode.removeChild(box); }, 6400);
+      }).observe(em, { attributes: true, attributeFilter: ["class"] });
+    }
+  } catch (e) { }
+})();
+</script>
+
+<!-- ============ @ xray-solution · 教学数据层 ============ -->
+<script id="xray-solution-data">
+(function () {
+  "use strict";
+  var X = window.XRAY_SOL = {
+    /* 手册底本（与防骗手册 / 五步扫描一致；「拟新增」为本轮为让每家命中组合唯一而补的条款） */
+    STEP: {
+      "01": { k: "照毛利率", rule: "毛利率要跟同行比：高得离谱又讲不清为什么，就要警惕。" },
+      "02": { k: "验现金流", rule: "利润 ≠ 真钱。经营现金流要常年为正，并且匹配净利润。" },
+      "03": { k: "查增长", rule: "增长要看它从哪来：主营变强，还是靠赊账、借款、补贴堆出来的。" },
+      "04": { k: "挑红黄绿", rule: "红灯一票否决、黄灯必须求证、绿灯三项齐备才放行。" },
+      "05": { k: "判结论", rule: "三项以上指标互相印证才下手；出现红灯就别自欺欺人。" }
+    },
+    RED: {
+      R1: "审计机构给出非标准意见（会计师都不敢背书）", R2: "收入和现金流严重背离",
+      R3: "频繁更换财务总监 / 审计所", R4: "涉及关联方交易的金额异常巨大",
+      R5: "股价大涨但业务完全看不懂", R6: "控股股东质押比例超过 70%（随时可能被平仓套现跑路）",
+      R7: "公司或实控人是失信被执行人（有钱不还，信用破产）",
+      R8: "存货周转天数远超同行且持续增长（拟新增）",
+      R9: "商誉占总资产比例过高，一次减值即可抹平利润（拟新增）",
+      R10: "业绩高度依赖政府补贴，补贴退坡后造血能力归零（拟新增）"
+    },
+    YEL: {
+      Y1: "毛利率远高于同行且无解释", Y2: "应收账款占比过高", Y3: "存货突然暴增",
+      Y4: "子公司 / 海外业务占收入大比例但难核实",
+      Y5: "合同纠纷、欠税、贷款展期等信用瑕疵近期增多",
+      Y6: "投诉、讨薪等负面舆情短期集中爆发",
+      Y7: "应收账款周转天数远超同行（拟新增）",
+      Y8: "资产负债率显著高于同行或行业警戒线（拟新增）",
+      Y9: "审计意见 / 审计报告无从查证（拟新增）",
+      Y10: "毛利率低于同行却宣称大举扩张或转型（拟新增）",
+      Y11: "其他应收款异常、关联交易公告频繁（拟新增）"
+    },
+    GRN: {
+      G1: "毛利率合理且稳定", G2: "现金流常年为正且匹配利润", G3: "增长可持续、行业地位清晰",
+      G4: "信用记录清白：无高质押、无被执行、无欠税", G5: "口碑稳定：合作方评价好、投诉率低"
+    },
+    SOL: {},   /* 24 家公司 */
+    CASE: {}   /* 反诈情景题（按 tag 索引） */
+  };
+  window.__SOLSLOT__ = X;
+})();
+/* ---- 11 家问题公司（完整版：解法 / 线索 / 手册对照 / 下次怎么防 / 复盘） ---- */
+(function () {
+  var S = window.XRAY_SOL.SOL;
+  S["汇金财富"] = {
+    truth: false, arch: "cf", verdict: "report", step: "02",
+    lights: [["R2", "red"], ["Y9", "yellow"]], score: "红灯 1 条 · 黄灯 1 条 = 42 分",
+    fix: "选「举报」—— 账面越漂亮，越要回头看现金流。",
+    clue: "毛利率 <b>58%</b>、营收 <b>+34%</b>，两张表都很漂亮；但 <b>经营现金流连续两年为负</b>，赚的钱一分没进账。更麻烦的是「<b>无审计意见披露</b>」—— 这个异常失去了第三方交叉验证。",
+    teach: "这正是手册 <b>第 ② 步「验现金流」</b> 的第一原则：<i>利润 ≠ 真钱，经营现金流要常年为正并匹配净利润</i>。它直接命中 <b>红灯第 2 条「收入和现金流严重背离」</b> —— 红灯一票否决，不必再看其他表。审计意见无从查证再补一条黄灯（拟新增）。合计 <b>42 分</b>：未到 60 分高危线，但只要出现红灯就该否决并举报。",
+    next: ["把净利润和经营活动现金流净额并排比，看缺口有多大", "利润为正 + 现金流转负 = 高度预警，连续两年基本可判定造假", "查不到审计意见的，一律按「无法验证」处理"],
+    review: {
+      invest: "你被 58% 毛利率带走了。第 ② 步已经亮红灯，红灯面前仍下注 —— 输在纪律，不是输在看不懂。",
+      report: "做对了。你用一条红灯挡下这颗雷，奖励 <b>+15 万</b>。",
+      pass: "不算错，但放弃了举报奖励；而且雷还在场上，下一个人还会踩。"
+    }
+  };
+  S["口味餐饮"] = {
+    truth: false, arch: "cf", verdict: "report", step: "02",
+    lights: [["R2", "red"], ["Y10", "yellow"], ["Y5", "yellow"]], score: "红灯 1 条 · 黄灯 2 条 = 54 分",
+    fix: "选「举报」—— 开了更多店，不等于赚了更多钱。",
+    clue: "毛利率只有 <b>31%</b>（同行约 40%）却在大举扩张；扩张的钱 <b>靠新开门店输血</b>，负债率已到 <b>63%</b>。另有 <b>3 起食安处罚</b>、<b>4 起供应商欠款纠纷</b> 与 <b>1 笔贷款展期</b>。",
+    teach: "毛利率低于同行 9 个百分点却讲着扩张故事 —— 先按 <b>第 ① 步「照毛利率」</b> 记一条黄灯（拟新增）。真正的杀招在 <b>第 ② 步</b>：扩张不靠自身造血、全靠借款，现金流必然背离，命中 <b>红灯第 2 条</b>。供应商欠款与贷款展期再多一条黄灯。合计 <b>54 分</b>，已越过「必须求证」线。",
+    next: ["门店数增长要配单店坪效一起看，只开店不赚钱就是失血", "连锁餐饮看「新店爬坡期现金流」，爬不过来就是负资产", "食安与欠款纠纷是现金流恶化前的先行指标"],
+    review: {
+      invest: "你被「门店越开越多」的扩张叙事说服了。但第 ② 步早就给出否决信号 —— 记住：扩张速度不是盈利能力。",
+      report: "做对了。你看穿了「借款堆出来的扩张」，奖励 <b>+15 万</b>。",
+      pass: "躲开了，但这家还在场上 —— 下一个踩雷的可能是你的对手。"
+    }
+  };
+  S["绿能电力"] = {
+    truth: false, arch: "lev", verdict: "report", step: "02",
+    lights: [["R6", "red"], ["R10", "red"], ["Y5", "yellow"], ["Y6", "yellow"]], score: "红灯 2 条 · 黄灯 2 条 = 84 分",
+    fix: "选「举报」—— 补贴养出来的利润，退坡就现原形。",
+    clue: "毛利率 <b>40%</b>、营收 <b>+15%</b> 单看都不差；但 <b>补贴退坡后现金流转负</b>，负债率 <b>71%</b>，<b>控股股东质押 87%</b>，还有 <b>2 笔欠税</b>，合作方公开抱怨回款慢。",
+    teach: "这是本局最典型的多雷叠加。先按 <b>第 ① 步</b> 看毛利率：40% 略高于同行，单看会被骗过去 —— 所以必须进 <b>第 ② 步</b>：扣掉补贴后主营造血为零，命中 <b>红灯第 10 条</b>（拟新增）；质押 87% 再命中 <b>红灯第 6 条</b>。欠税与回款抱怨各补一条黄灯。合计 <b>84 分</b>，远超 60 分高危线。",
+    next: ["政策依赖型生意要单独算「扣非净利润」：剔除补贴还剩多少", "查控股股东质押比例，超过 70% 意味着随时可能平仓抛售", "补贴退坡时间表要提前打听，别等现金流转负才反应"],
+    review: {
+      invest: "毛利率 40% 让你放行了。这正是「只看一步」的代价 —— 第 ② 步的现金流早就否决了它。",
+      report: "做对了。两盏红灯 + 84 分，你躲过了本局最贵的一颗雷。",
+      pass: "安全，但也错过了举报的 <b>+15 万</b> —— 高危公司留在场上只会害人。"
+    }
+  };
+  S["巨力地产"] = {
+    truth: false, arch: "lev", verdict: "report", step: "02",
+    lights: [["R6", "red"], ["R2", "red"], ["Y8", "yellow"]], score: "红灯 2 条 · 黄灯 1 条 = 72 分",
+    fix: "选「举报」—— 负债、质押、现金流，三项同时亮红。",
+    clue: "营收已经 <b>-4%</b>（在萎缩），负债率却高达 <b>74%</b>，<b>经营现金流转负</b>，<b>控股股东质押 82%</b>，毛利率 <b>27%</b> 也低于同行。",
+    teach: "<b>第 ③ 步「查增长」</b> 先给出衰退信号（营收 -4%）；再看 <b>第 ② 步</b>：现金流转负且负债 74%，利息都没得还，命中 <b>红灯第 2 条</b>；质押 82% 再命中 <b>红灯第 6 条</b> —— 股东被平仓会引发连锁崩塌。负债率显著高于同行补一条黄灯（拟新增）。合计 <b>72 分</b>。",
+    next: ["地产先看「现金短债比」：手上的钱够不够还一年内到期的债", "营收负增长 + 高负债是最危险的组合，直接否决", "控股股东质押比例是资金链的最后一道警报"],
+    review: {
+      invest: "你在一家营收萎缩、现金流为负、股东还把股票全押了的公司上下注 —— 这三条任意一条都够否决。",
+      report: "做对了。你把「三连雷」拆成了三条独立证据，奖励 <b>+15 万</b>。",
+      pass: "躲过了，但举报能拿 <b>+15 万</b>，还能把它从棋盘上封掉。"
+    }
+  };
+  S["优品电商"] = {
+    truth: false, arch: "ar", verdict: "report", step: "02",
+    lights: [["R2", "red"], ["Y1", "yellow"], ["Y2", "yellow"], ["Y7", "yellow"]], score: "红灯 1 条 · 黄灯 3 条 = 66 分",
+    fix: "选「举报」—— 营收涨得越猛，越要看钱有没有到账。",
+    clue: "营收 <b>+52%</b> 极其亮眼，但 <b>应收账款周转 265 天</b> —— 货卖出去了，钱要等大半年才回来；另有 <b>商誉占总资产 38%</b>，毛利率 <b>44%</b> 高于同行且无解释。",
+    teach: "<b>第 ③ 步「查增长」</b> 看到 +52% 会心动，但紧接着要用 <b>第 ② 步</b> 验证：钱没到账，增长就是赊出来的，命中 <b>红灯第 2 条</b>。应收周转远超同行记黄灯（拟新增），应收占比过高、毛利率高于同行无解释各记一条。合计 <b>66 分</b>，已过高危线。",
+    next: ["营收增速要配「应收账款周转天数」一起看，两者背离就是刷单", "电商看「回款周期 vs 平台账期」，长期倒挂必然崩", "商誉占比超过总资产 1/3 就要单独评估减值风险"],
+    review: {
+      invest: "你被 +52% 的增速带走了。记住手册第 ③ 步的原话：<i>增长要看它从哪来</i> —— 这笔增长来自赊账。",
+      report: "做对了。你用「回款周期」拆穿了纸面增长，奖励 <b>+15 万</b>。",
+      pass: "没亏钱，但错过了封掉它的机会，也没拿到举报奖励。"
+    }
+  };
+  S["智通健康"] = {
+    truth: false, arch: "ar", verdict: "report", step: "02",
+    lights: [["R9", "red"], ["R2", "red"], ["Y1", "yellow"]], score: "红灯 2 条 · 黄灯 1 条 = 72 分",
+    fix: "选「举报」—— 一半资产是商誉，一次减值全蒸发。",
+    clue: "毛利率 <b>52%</b> 很健康，营收 <b>+19%</b> 也不错；但 <b>商誉占总资产 51%</b>（过半！），<b>应收账款周转 310 天</b>，钱迟迟收不回来。",
+    teach: "这家最会伪装：前两步单看都过关。破绽在资产结构上 —— <b>商誉占总资产 51%</b>，命中 <b>红灯第 9 条</b>（拟新增）：一次减值就能把利润抹平。再按 <b>第 ② 步</b>，应收 310 天等同现金流背离，命中 <b>红灯第 2 条</b>。毛利率高于同行无解释补一条黄灯。合计 <b>72 分</b>。",
+    next: ["商誉 = 收购溢价，占总资产超过 40% 就要单独做减值压力测试", "互联网医疗看「回款方是谁」，回款慢要看现金流能否撑住", "高毛利 + 高商誉的组合，往往是靠并购堆出来的增长"],
+    review: {
+      invest: "52% 毛利率让你放行了 —— 但你漏看了资产端：一半资产是随时可能减值的商誉。",
+      report: "做对了。你没有停在「好看的利润表」，而是翻到了资产负债表。",
+      pass: "躲开了。但 72 分的高危公司，举报才是收益最高的动作（<b>+15 万</b>）。"
+    }
+  };
+})();
+(function () {
+  var S = window.XRAY_SOL.SOL;
+  S["传媒万象"] = {
+    truth: false, arch: "ar", verdict: "report", step: "02",
+    lights: [["R9", "red"], ["R2", "red"], ["Y7", "yellow"], ["Y5", "yellow"]], score: "红灯 2 条 · 黄灯 2 条 = 84 分",
+    fix: "选「举报」—— 账面利润只是一串还没收回来的会计分录。",
+    clue: "营收几乎停滞（<b>+3%</b>），但 <b>应收账款周转 240 天</b>、<b>商誉占总资产 42%</b>，另有 <b>5 起合同纠纷诉讼</b>，供应商已公开发函催款。",
+    teach: "<b>第 ③ 步</b> 就发现增长已经讲完（+3% 近乎停滞）；<b>第 ② 步</b> 确认钱收不回来，命中 <b>红灯第 2 条</b>；资产端 <b>商誉占 42%</b> 再命中 <b>红灯第 9 条</b>。应收周转异常与集中诉讼各补一条黄灯。合计 <b>84 分</b>，是「纸面富贵」的典型。",
+    next: ["传媒 / 广告看「应收账款周转天数」，超过 180 天就要打问号", "商誉占比过半的并购型公司，把商誉从资产里扣掉再看负债率", "供应商公开催款是最直白的现金流警报"],
+    review: {
+      invest: "你在一家增长停滞、钱收不回、资产四成是商誉的公司上投了钱 —— 三个维度同时报警。",
+      report: "做对了。84 分的高危样本，你验证了「收入 ≠ 现金」这条铁律。",
+      pass: "没亏，但也没拿到举报奖励；这家公司还会继续留在盘面上。"
+    }
+  };
+  S["汇金矿业"] = {
+    truth: false, arch: "inv", verdict: "report", step: "02",
+    lights: [["R8", "red"], ["R2", "red"], ["Y3", "yellow"]], score: "红灯 2 条 · 黄灯 1 条 = 72 分",
+    fix: "选「举报」—— 货压在矿洞里，现金全变成了库存。",
+    clue: "营收只涨 <b>+6%</b>，但 <b>存货周转 340 天</b>、<b>存货占总资产 46%</b>，毛利率 <b>31%</b> 看着正常 —— 钱全被库存吃掉了。",
+    teach: "<b>第 ② 步「验现金流」</b> 是解这道题的钥匙：存货周转 340 天，卖出去的周期接近一年，经营现金流必然被存货吃干净，命中 <b>红灯第 8 条</b>（拟新增）与 <b>红灯第 2 条</b>。存货暴增再补一条黄灯。合计 <b>72 分</b>。周期性行业尤其要给存货打折看。",
+    next: ["存货周转天数明显高于同行就要警惕，矿业超过 200 天即异常", "把存货按可变现净值打折后再算一次负债率", "周期品还要叠加价格周期：跌价时存货会二次减值"],
+    review: {
+      invest: "31% 毛利率让你以为它是门好生意。但货卖不动，毛利率只是账面数字。",
+      report: "做对了。你用「存货周转」这个最朴素指标拆穿了它，奖励 <b>+15 万</b>。",
+      pass: "安全通过，但举报可以把它直接查封，收益更高。"
+    }
+  };
+  S["天下粮仓"] = {
+    truth: false, arch: "rel", verdict: "report", step: "02",
+    lights: [["R4", "red"], ["Y11", "yellow"], ["Y8", "yellow"]], score: "红灯 1 条 · 黄灯 2 条 = 54 分",
+    fix: "选「举报」—— 钱不是亏掉的，是被自己人借走的。",
+    clue: "营收 <b>+13%</b>、毛利率 <b>26%</b> 都属正常，负债 <b>52%</b> 也不算离谱；但 <b>关联方占款 9800 万</b>，还有 <b>2 起关联交易公告</b> —— 钱以借款名义流了出去。",
+    teach: "这类比直接造假更隐蔽：<b>第 ② 步</b> 要顺着「其他应收款」往下追，钱去了关联方，命中 <b>红灯第 4 条「涉及关联方交易的金额异常巨大」</b>。关联交易公告频繁记黄灯（拟新增），负债率高于仓储同行再记一条。合计 <b>54 分</b>。",
+    next: ["查「其他应收款」明细：金额大又说不清用途，就是占款", "关联交易要看「定价是否公允」，长期低价输出即为利益输送", "把关联方占款从资产中剔除，再重算一次真实的资产负债率"],
+    review: {
+      invest: "各项指标都不刺眼 —— 这正是关联方占款的隐蔽之处：钱不是亏掉的，是被借走的。",
+      report: "做对了。你追到了「其他应收款」，奖励 <b>+15 万</b>。",
+      pass: "没亏钱，但举报既能拿奖励，也能阻止它继续抽干公司。"
+    }
+  };
+  S["宏图资本"] = {
+    truth: false, arch: "sub", verdict: "report", step: "02",
+    lights: [["R10", "red"], ["Y5", "yellow"], ["Y1", "yellow"]], score: "红灯 1 条 · 黄灯 2 条 = 54 分",
+    fix: "选「举报」—— 补贴一断，主营立刻裸泳。",
+    clue: "毛利率 <b>49%</b>、营收 <b>+22%</b> 都很漂亮；但 <b>补贴退坡后现金流转负</b>，还有 <b>1 起政策合规问询</b> —— 利润是靠政策养出来的。",
+    teach: "关键动作是算「<b>扣非净利润</b>」：剔除政府补贴与税收优惠后还剩多少？补贴一退坡现金流转负，命中 <b>红灯第 10 条</b>（拟新增）。政策合规问询记黄灯，毛利率 49% 高于同行且无解释再记一条。合计 <b>54 分</b>。政策依赖型生意不该按成长股估值。",
+    next: ["看扣非净利润，而不是净利润 —— 前者才反映真实经营能力", "补贴占利润比例超过 30% 就要按「政策股」而非「成长股」估值", "提前跟踪补贴退坡时间表，别等现金流转负"],
+    review: {
+      invest: "49% 毛利率 + 22% 增速很有说服力，但那些利润大部分来自财政，不是市场。",
+      report: "做对了。你用「扣非」这把尺子量出了真实造血能力，奖励 <b>+15 万</b>。",
+      pass: "躲开了。但举报能拿 <b>+15 万</b>，还能把它从盘面封掉。"
+    }
+  };
+  S["智造工厂"] = {
+    truth: false, arch: "inv", verdict: "report", step: "02",
+    lights: [["R4", "red"], ["R8", "red"], ["R7", "red"], ["Y6", "yellow"]], score: "红灯 3 条 · 黄灯 1 条 = 102 分",
+    fix: "选「举报」—— 营收在退、货卖不动、钱还被自己人占着。",
+    clue: "营收 <b>-6%</b>（衰退中），毛利率 <b>18%</b> 低于同行却宣称智能制造升级；<b>存货周转 310 天</b>、<b>关联方占款 1.2 亿</b>，<b>实控人被列为失信被执行人</b>，员工讨薪舆情多发。",
+    teach: "这是本局雷点最密的一家。三条红灯各自独立成立 —— 按 <b>第 ④ 步</b> 的清单：关联方占款巨大（<b>红灯 4</b>）、存货周转远超同行（<b>红灯 8</b>，拟新增）、实控人失信被执行（<b>红灯 7</b>）。员工讨薪舆情补一条黄灯。合计 <b>102 分</b>，任意一条单拎出来都够否决。",
+    next: ["实控人是失信被执行人 = 信用破产，一票否决，不必再看财报", "存货周转 + 关联方占款同时出现，基本可判定资金已被抽干", "营收负增长时还讲「升级扩张」，逻辑本身就不自洽"],
+    review: {
+      invest: "三条红灯、102 分 —— 你买下了本局最贵的一颗雷。回头看看：任意一条都足以让你停下。",
+      report: "做对了。你完成了本局难度最高的一次识别，奖励 <b>+15 万</b>。",
+      pass: "成功避开了最重的雷。但举报能把它彻底查封，收益更高。"
+    }
+  };
+})();
+/* ---- 13 家绿灯公司（简版：解法 / 线索 / 手册对照 / 复盘） ---- */
+(function () {
+  var S = window.XRAY_SOL.SOL;
+  S["云栖科技"] = {
+    truth: true, arch: "stable", verdict: "invest", step: "02",
+    lights: [["G1", "green"], ["G2", "green"], ["G3", "green"], ["G4", "green"]], score: "绿灯 4 条 · 无红黄灯",
+    fix: "可以投资 —— 三张表互相印证的样板公司。",
+    clue: "毛利率 <b>54%</b>（云计算行业合理区间）、营收 <b>+38%</b>、负债率仅 <b>28%</b>，<b>经营现金流为正</b>，无重大诉讼，客户续约率高。",
+    teach: "对照手册 <b>第 ② 步</b>：现金流常年为正且匹配利润（<b>绿灯第 2 条</b>）；毛利率合理稳定（<b>绿灯第 1 条</b>）；增长可持续（<b>绿灯第 3 条</b>）；信用记录清白（<b>绿灯第 4 条</b>）。四项齐备，按 <b>第 ④ 步</b> 放行。",
+    review: {
+      invest: "做对了。这是最标准的「三好学生」，你的判断有四条绿灯支撑。",
+      report: "误报 <b>-8 万</b>。你把一家各项指标都对得上的公司当成了风险 —— 举报要建立在证据上。",
+      pass: "放弃了本局最稳的一家公司，可惜。"
+    }
+  };
+  S["潮玩工坊"] = {
+    truth: true, arch: "light", verdict: "invest", step: "02",
+    lights: [["G1", "green"], ["G2", "green"], ["G5", "green"]], score: "绿灯 3 条 · 无红黄灯",
+    fix: "可以投资 —— 高毛利能对模式自圆其说，就不是雷。",
+    clue: "毛利率 <b>61%</b> 极高，但这是 IP 授权的轻资产模式；<b>预收款充足</b>，负债率仅 <b>19%</b>，粉丝复购口碑强，无诉讼。",
+    teach: "对照 <b>第 ① 步</b>：高毛利本身不是问题，<i>可怕的是高毛利却说不清为什么</i> —— 这家说得清（IP 授权）。<b>第 ② 步</b> 预收款充足、现金流为正（<b>绿灯第 2 条</b>），口碑稳定（<b>绿灯第 5 条</b>）。按 <b>第 ④ 步</b> 放行。",
+    review: {
+      invest: "做对了。你没有把「高毛利」误判成异常，而是先问了它为什么高。",
+      report: "误报 <b>-8 万</b>。61% 毛利在这个模式里是合理的 —— 判异常前先确认行业坐标。",
+      pass: "错过了。轻资产 + 预收款是最健康的现金流形态之一。"
+    }
+  };
+  S["星链物流"] = {
+    truth: true, arch: "heavy", verdict: "invest", step: "02",
+    lights: [["G2", "green"], ["G3", "green"], ["G4", "green"]], score: "绿灯 3 条 · 1 起已结案纠纷（不构成黄灯）",
+    fix: "可以投资 —— 负债 45% 在重资产行业属正常区间。",
+    clue: "毛利率 <b>22%</b>（物流行业正常）、负债率 <b>45%</b>、<b>运输设备折旧大但现金流稳</b>，营收 <b>+21%</b>；仅 1 起劳务纠纷且已结案。",
+    teach: "关键在 <b>第 ② 步</b>：判定标准不是负债率数字，而是<b>经营现金流能否覆盖利息</b> —— 这家可以（<b>绿灯第 2 条</b>）。已结案的小额纠纷不构成「信用瑕疵增多」这条黄灯。增长可持续（<b>绿灯第 3 条</b>）、记录清白（<b>绿灯第 4 条</b>）。",
+    review: {
+      invest: "做对了。你没有被 45% 的负债率吓退 —— 「负债高 ≠ 有雷」。",
+      report: "误报 <b>-8 万</b>。你把重资产行业的常态负债当成了风险信号。",
+      pass: "错过了。判断高负债公司的正确尺子是现金流覆盖能力。"
+    }
+  };
+  S["数智医疗"] = {
+    truth: true, arch: "stable", verdict: "invest", step: "01",
+    lights: [["G1", "green"], ["G2", "green"], ["G5", "green"]], score: "绿灯 3 条 · 无红黄灯",
+    fix: "可以投资 —— 68% 毛利率放在创新器械赛道属常态。",
+    clue: "毛利率 <b>68%</b> 看似离谱，但创新器械本就是高毛利赛道；<b>研发投入高但回款快</b>，负债率 <b>24%</b>，多家三甲医院合作背书。",
+    teach: "对照 <b>第 ① 步</b> 的关键技巧：<i>毛利率一定要放进同行坐标里比</i> —— 68% 在创新器械是常态，不构成黄灯。诉讼要分原告被告：这家是<b>主动维权</b>的原告，不是被追债。<b>第 ② 步</b> 回款快、现金流为正（<b>绿灯第 2 条</b>）。",
+    review: {
+      invest: "做对了。你分清了「高毛利 = 异常」和「高毛利 = 行业特性」的区别。",
+      report: "误报 <b>-8 万</b>。看到 68% 毛利就报警，是跳过了第 ① 步的同行对比。",
+      pass: "错过了。看诉讼一定要看它是原告还是被告。"
+    }
+  };
+  S["云顶商城"] = {
+    truth: true, arch: "heavy", verdict: "invest", step: "02",
+    lights: [["G2", "green"], ["G4", "green"], ["G5", "green"]], score: "绿灯 3 条 · 无红黄灯",
+    fix: "可以投资 —— 商业地产天生高负债，看租金能否覆盖利息。",
+    clue: "负债率 <b>52%</b>、营收仅 <b>+7%</b> 看着平淡；但 <b>租金现金流稳定</b>，抵押物充足，商户续租率口碑好，无诉讼。",
+    teach: "商业地产的负债率天然偏高，<b>第 ② 步</b> 的正确问法是：<b>租金现金流能不能稳定覆盖利息</b>？这家可以（<b>绿灯第 2 条</b>）。抵押物充足、信用正常（<b>绿灯第 4 条</b>），商户口碑稳定（<b>绿灯第 5 条</b>）。增速慢不等于有雷。",
+    review: {
+      invest: "做对了。你没有把「增速慢」和「有问题」划等号。",
+      report: "误报 <b>-8 万</b>。52% 负债对商业地产是常态，判据是租金覆盖利息的能力。",
+      pass: "错过了。稳定现金流的商业地产是棋盘上很好的收租资产。"
+    }
+  };
+  S["文创园区"] = {
+    truth: true, arch: "stable", verdict: "invest", step: "03",
+    lights: [["G1", "green"], ["G2", "green"], ["G5", "green"]], score: "绿灯 3 条 · 无红黄灯",
+    fix: "可以投资 —— 小而美，现金流可预测。",
+    clue: "毛利率 <b>47%</b> 与同行持平，<b>入驻率 92%</b>，营收 <b>+17%</b>，负债率 <b>33%</b>，租户满意度高，无诉讼。",
+    teach: "对照 <b>第 ③ 步</b>：+17% 的增速来自入驻率提升，是主营变强而非赊账堆出来的。<b>第 ② 步</b> 现金流可预测（<b>绿灯第 2 条</b>），毛利率与同行持平（<b>绿灯第 1 条</b>），口碑稳定（<b>绿灯第 5 条</b>）。规模小不是风险。",
+    review: {
+      invest: "做对了。这是「小而美」的典型样本，规模小 ≠ 风险高。",
+      report: "误报 <b>-8 万</b>。没有红灯却举报，会被判恶意举报。",
+      pass: "错过了。15 万的价格配 92% 入驻率，性价比很高。"
+    }
+  };
+  S["云帆软件"] = {
+    truth: true, arch: "light", verdict: "invest", step: "01",
+    lights: [["G1", "green"], ["G2", "green"], ["G3", "green"]], score: "绿灯 3 条 · 无红黄灯",
+    fix: "可以投资 —— 订阅制是现金流质量最高的模式之一。",
+    clue: "毛利率 <b>68%</b>、营收 <b>+41%</b> 都很亮眼，<b>经营现金流连续为正</b>，负债率仅 <b>21%</b>，续费率 <b>92%</b>，几乎不借钱。",
+    teach: "对照 <b>第 ① 步</b>：68% 毛利在企业软件（订阅制）里是行业特征，说得清。<b>第 ② 步</b> 现金流连续为正（<b>绿灯第 2 条</b>），<b>第 ③ 步</b> 增长来自续费而非一次性大单（<b>绿灯第 3 条</b>）。三表互相印证。",
+    review: {
+      invest: "做对了。高毛利 + 高续费 + 不借钱，这是最干净的一类资产。",
+      report: "误报 <b>-8 万</b>。把「高毛利」直接当异常，是漏了同行坐标这一步。",
+      pass: "错过了。订阅制的现金流质量是全场最高的。"
+    }
+  };
+})();
+(function () {
+  var S = window.XRAY_SOL.SOL;
+  S["恒信保险"] = {
+    truth: true, arch: "stable", verdict: "invest", step: "02",
+    lights: [["G2", "green"], ["G4", "green"], ["G5", "green"]], score: "绿灯 3 条 · 1 起已结案条款纠纷（不构成黄灯）",
+    fix: "可以投资 —— 保费现金流稳定，赔付率可控。",
+    clue: "毛利率 <b>34%</b>（保险经纪行业正常）、负债率 <b>43%</b>，<b>保费现金流稳定</b>且与利润匹配，仅 1 起条款纠纷已结案。",
+    teach: "对照 <b>第 ② 步</b>：保费是先收后赔，现金流结构天然健康（<b>绿灯第 2 条</b>）。43% 负债里含大量准备金，不是借来的钱。已结案的条款纠纷不构成「信用瑕疵增多」。口碑与记录均清白（<b>绿灯第 4、5 条</b>）。",
+    review: {
+      invest: "做对了。你分清了「准备金负债」和「借款负债」。",
+      report: "误报 <b>-8 万</b>。保险公司的负债率高是行业结构，不是风险。",
+      pass: "错过了。保费型现金流是很好的防守型资产。"
+    }
+  };
+  S["蓝湾冷链"] = {
+    truth: true, arch: "heavy", verdict: "invest", step: "02",
+    lights: [["G2", "green"], ["G3", "green"], ["G4", "green"]], score: "绿灯 3 条 · 无红黄灯",
+    fix: "可以投资 —— 这是最容易误判的一类好公司。",
+    clue: "负债率 <b>48%</b> 看着吓人，但冷链是重资产行业，折旧大属常态；<b>经营现金流稳</b>，租金与运费能覆盖利息；毛利率 <b>24%</b> 落在制造业正常区间，营收 <b>+18%</b>。",
+    teach: "对应手册 <b>第 ② 步「验现金流」</b>：判定标准不是负债率数字，而是现金流覆盖能力。这家命中 <b>绿灯第 2 条「现金流常年为正且匹配利润」</b> 与 <b>绿灯第 4 条「信用记录清白」</b>。三项绿灯齐备，按 <b>第 ④ 步</b> 放行。",
+    review: {
+      invest: "做对了。你识破了「高负债 = 有雷」的直觉陷阱。",
+      report: "误报 <b>-8 万</b>。你把行业常态当成了风险信号。",
+      pass: "错过了一个反直觉的正样本 —— 记住第 ② 步的这条判定标准。"
+    }
+  };
+  S["鼎元装备"] = {
+    truth: true, arch: "stable", verdict: "invest", step: "01",
+    lights: [["G1", "green"], ["G2", "green"], ["G3", "green"]], score: "绿灯 3 条 · 无红黄灯",
+    fix: "可以投资 —— 毛利率符合装备行业水平，现金流与利润匹配。",
+    clue: "毛利率 <b>36%</b>（高端装备行业正常区间）、营收 <b>+15%</b>，<b>经营现金流为正且稳定</b>，负债率 <b>39%</b>，无诉讼。",
+    teach: "对照 <b>第 ① 步</b>：36% 落在装备制造合理区间，不构成黄灯。<b>第 ② 步</b> 现金流为正且稳定（<b>绿灯第 2 条</b>），<b>第 ③ 步</b> 增长来自主营订单而非关联交易（<b>绿灯第 3 条</b>）。三表对得上。",
+    review: {
+      invest: "做对了。各项指标都在合理区间且互相印证。",
+      report: "误报 <b>-8 万</b>。没有任何红灯却举报，会被判恶意举报。",
+      pass: "放弃了。这类稳健制造业是长期持有的好标的。"
+    }
+  };
+  S["绿源食品"] = {
+    truth: true, arch: "stable", verdict: "invest", step: "03",
+    lights: [["G2", "green"], ["G4", "green"], ["G5", "green"]], score: "绿灯 3 条 · 无红黄灯",
+    fix: "可以投资 —— 薄利多销，但现金流很健康。",
+    clue: "毛利率仅 <b>29%</b>、营收 <b>+9%</b> 都不起眼；但 <b>现金流常年为正</b>，负债率低（<b>32%</b>），无诉讼，经营稳健。",
+    teach: "对照 <b>第 ① 步</b>：薄利不等于坏生意，快消食品本就是低毛利高周转。<b>第 ③ 步</b> 增速虽只有 +9%，但来自主营而非赊账（<b>绿灯第 3 条</b>）。<b>第 ② 步</b> 现金流常年为正（<b>绿灯第 2 条</b>）。别用增速否定现金流。",
+    review: {
+      invest: "做对了。你没有被「低毛利 + 低增速」的表象劝退。",
+      report: "误报 <b>-8 万</b>。低毛利是行业属性，不是财务造假的信号。",
+      pass: "错过了。19 万的价格配常年正现金流，是很稳的收租资产。"
+    }
+  };
+  S["安泰基建"] = {
+    truth: true, arch: "heavy", verdict: "invest", step: "02",
+    lights: [["G2", "green"], ["G3", "green"], ["G5", "green"]], score: "绿灯 3 条 · 1 起已结案工程款纠纷（不构成黄灯）",
+    fix: "可以投资 —— 负债 51% 但有在手订单托底。",
+    clue: "毛利率 <b>22%</b>（建筑工程行业正常）、负债率 <b>51%</b>，但 <b>在手订单能覆盖利息</b>，营收 <b>+7%</b>；仅 1 起工程款纠纷且已结案。",
+    teach: "工程类公司负债高是行业结构，<b>第 ② 步</b> 的正确问法是：<b>在手订单形成的回款能不能覆盖利息与刚性支出</b>？这家可以（<b>绿灯第 2 条</b>）。已结案纠纷不构成黄灯。增长可持续（<b>绿灯第 3 条</b>）、口碑稳定（<b>绿灯第 5 条</b>）。",
+    review: {
+      invest: "做对了。你用「订单覆盖能力」而不是负债率做了判断。",
+      report: "误报 <b>-8 万</b>。建筑业 51% 负债属常态，关键看订单回款。",
+      pass: "错过了。有订单托底的基建是低风险的收租标的。"
+    }
+  };
+  S["星海影业"] = {
+    truth: true, arch: "light", verdict: "invest", step: "02",
+    lights: [["G1", "green"], ["G2", "green"], ["G3", "green"]], score: "绿灯 3 条 · 无红黄灯",
+    fix: "可以投资 —— 版权预售款就是最好的现金流证明。",
+    clue: "毛利率 <b>47%</b>、营收 <b>+26%</b> 都不错，<b>版权预售款充足</b>（先收钱后交付），负债率仅 <b>27%</b>，无诉讼。",
+    teach: "影视公司最大的风险是项目烂尾，而 <b>第 ② 步</b> 的判定点是<i>钱是否已经先收进来</i> —— 版权预售款充足（<b>绿灯第 2 条</b>）。毛利率符合内容行业特征（<b>绿灯第 1 条</b>），增长来自 IP 授权而非一次性大单（<b>绿灯第 3 条</b>）。",
+    review: {
+      invest: "做对了。你抓住了影视行业最关键的「预售回款」指标。",
+      report: "误报 <b>-8 万</b>。预售款充足意味着现金流已经落袋，不是风险。",
+      pass: "错过了。17 万的低价格配预售回款，性价比不错。"
+    }
+  };
+})();
+/* ---- 反诈情景题：正确解法 + 话术线索 + 规则对照 ---- */
+(function () {
+  var C = window.XRAY_SOL.CASE;
+  C["冒充公检法"] = {
+    a: "risk", fix: "选「举报」—— 公检法绝不会电话办案。",
+    clue: "话术关键词：「<b>涉嫌洗钱</b>」「<b>安全账户</b>」「<b>涉密不许告诉任何人</b>」。凡是让你把钱转到「安全账户」并要求保密的，一律是诈骗。",
+    teach: "对应国家反诈口径：公安机关 <b>不会</b> 通过电话 / 网络办案，也 <b>不存在</b> 任何形式的「安全账户」。正确动作是立即挂断，自行拨打 <b>110 或 96110</b> 核实。",
+    next: "接到此类电话直接挂断，用自己拨出的号码回拨 110 / 96110。",
+    review: { invest: "你照做了 —— 钱一旦进「安全账户」几乎追不回。", report: "做对了。96110 是你唯一该拨的号码。", pass: "没损失，但也错过了给警方留线索的机会。" }
+  };
+  C["刷单返利"] = {
+    a: "risk", fix: "选「举报」—— 先垫资的兼职都是诈骗。",
+    clue: "话术关键词：「<b>动动手指日赚三百</b>」「<b>先垫付下单</b>」「<b>好评返本金加佣金</b>」。刷单本身违法，要求垫资就一定是骗局。",
+    teach: "前期小额返利是诱饵，目的是诱导加大投入，最终以「系统故障」「任务未完成」为由拒绝提现。这条对应手册 <b>第 ⑤ 步</b>：<i>在红灯面前不要自欺欺人</i> —— 「先给钱再赚钱」本身就是红灯。",
+    next: "凡是要求先垫资的兼职一律拒绝；已转账立即保留证据并拨打 96110。",
+    review: { invest: "你垫了资 —— 前期的小额返利正是为了这一刻。", report: "做对了。刷单违法 + 垫资 = 双重红灯。", pass: "安全。记住：正规兼职不会让你先掏钱。" }
+  };
+  C["冒充客服退款"] = {
+    a: "risk", fix: "选「举报」—— 正规退款一律原路退回。",
+    clue: "话术关键词：「<b>双倍理赔</b>」「<b>下载指定会议 APP</b>」「<b>开启屏幕共享</b>」「<b>提供验证码</b>」。",
+    teach: "正规退款<b>只会沿原支付渠道原路退回</b>，不会要求下载陌生 APP、开启屏幕共享或索取验证码。屏幕共享等于把手机完全交给对方。",
+    next: "退款只认原路退回；凡是索要验证码、要求共享屏幕的，一律挂断。",
+    review: { invest: "你开了屏幕共享 —— 对方能看到你输入的所有密码和验证码。", report: "做对了。验证码是最后一道防线，绝不能给。", pass: "安全。退款请自己在购物平台内发起。" }
+  };
+  C["非法荐股"] = {
+    a: "risk", fix: "选「举报」—— 「内幕消息」「收益翻倍」是标准话术。",
+    clue: "话术关键词：「<b>内部 VIP 群</b>」「<b>三周收益翻倍</b>」「<b>内幕消息</b>」「<b>缴纳会员费</b>」。未经许可从事证券投资咨询属非法经营。",
+    teach: "对照手册 <b>第 ① 步</b> 的思路：<i>收益高得离谱又讲不清为什么，就要警惕</i>。荐股群里的「老师」往往反向收割会员。合法机构可在<b>中国证监会官网</b>查询。",
+    next: "查机构资质去证监会官网；承诺收益的荐股一律拉黑。",
+    review: { invest: "你交了会员费 —— 接下来还有「升级服务」「内幕通道」等着你。", report: "做对了。承诺收益本身就违反金融广告规定。", pass: "安全。投资咨询请找持牌机构。" }
+  };
+  C["民族资产解冻"] = {
+    a: "risk", fix: "选「举报」—— 我国从未开展此类项目。",
+    clue: "话术关键词：「<b>民族资产解冻委员会</b>」「<b>缴纳会费</b>」「<b>解冻后得 500 万</b>」「<b>发展下线提升额度</b>」。",
+    teach: "「民族资产解冻」是彻头彻尾的骗局，我国从未开展此类项目。要求先交手续费再领巨额回报、还要发展下线的，本质是传销 + 诈骗。",
+    next: "凡要求缴纳手续费领取巨额回报的，一律不信不转。",
+    review: { invest: "你交了会费 —— 后面还有「解冻手续费」「税费」连环收费。", report: "做对了。这类项目本身就是虚构的。", pass: "安全。天上不会掉扶贫款。" }
+  };
+  C["虚假票务"] = {
+    a: "risk", fix: "选「举报」—— 门票转让只走官方渠道。",
+    clue: "话术关键词：「<b>内部票</b>」「<b>先款后票</b>」「<b>限时一小时</b>」「<b>实名认证后直接过户</b>」。",
+    teach: "脱离平台的私下转账毫无保障，付款后即被拉黑，购票实名信息还可能被倒卖。正规转让应走官方转赠渠道。",
+    next: "门票转让务必走官方转赠；私下先款后票一律拒绝。",
+    review: { invest: "你先付了款 —— 对方下一秒就会拉黑你。", report: "做对了。脱离平台担保的交易不受任何保护。", pass: "安全。买票请认准官方或官方转赠。" }
+  };
+  C["境外务工骗局"] = {
+    a: "risk", fix: "选「举报」—— 代收转账实为洗钱。",
+    clue: "话术关键词：「<b>境外直招</b>」「<b>月入三万包食宿</b>」「<b>帮忙代收款再转账</b>」。",
+    teach: "境外高薪招聘常伴随偷渡、强迫劳动甚至诈骗犯罪。<b>代收转账实为洗钱</b>，参与者会被依法追究刑事责任 —— 这已经不是「被骗」，而是涉嫌犯罪。",
+    next: "境外务工走正规外派渠道；凡涉及代收代转的一律拒绝并报警。",
+    review: { invest: "你答应了 —— 代收转账会让你成为洗钱链条的一环，要负刑责。", report: "做对了。这类「工作」本身就是犯罪。", pass: "安全。出境务工请走有资质的外派公司。" }
+  };
+  C["假冒银行APP"] = {
+    a: "risk", fix: "选「举报」—— 银行不会用短信链接让你下载 APP。",
+    clue: "话术关键词：「<b>手机银行今日失效</b>」「<b>点击链接下载</b>」「<b>输入卡号、密码与验证码</b>」。",
+    teach: "银行<b>不会</b>用短信链接要求下载 APP 或输入完整密码、验证码。应用请从官方商店下载；收到此类短信先拨打卡面官方客服核实。",
+    next: "APP 只从官方商店下载；短信链接一律不点。",
+    review: { invest: "你填了卡号密码验证码 —— 账户会在几分钟内被清空。", report: "做对了。卡面客服电话是唯一可信的核实渠道。", pass: "安全。银行升级只会通过官方 APP 内提示。" }
+  };
+  C["冒充领导转账"] = {
+    a: "risk", fix: "选「举报」—— 转账前必须当面或电话核实。",
+    clue: "话术关键词：「<b>我在开紧急会议不便通话</b>」「<b>先转到这个账户</b>」「<b>会后立刻补手续</b>」。",
+    teach: "「<b>紧急 + 涉密 + 不方便接电话</b>」是冒充领导 / 熟人诈骗的固定三件套。凡是自称领导要求转账的，务必当面或拨打原预留电话核实。",
+    next: "财务转账必须双人复核；自称领导要求转账的一律当面核实。",
+    review: { invest: "你转了 58 万 —— 「涉密」正是为了阻止你去核实。", report: "做对了。核实一次只需一分钟，损失的却是几十万。", pass: "安全。任何转账指令都要二次确认。" }
+  };
+  C["代办信用卡"] = {
+    a: "risk", fix: "选「举报」—— 信用卡审批由银行免费办理。",
+    clue: "话术关键词：「<b>黑户也能批</b>」「<b>前期缴纳保证金与手续费</b>」「<b>包过下卡</b>」。",
+    teach: "信用卡审批由银行<b>免费</b>办理，不存在「黑户包过」「百分百下卡」。提交材料还会造成个人信息泄露，甚至被用于办卡洗钱。",
+    next: "办卡只走银行官方渠道；凡收手续费代办的一律拒绝。",
+    review: { invest: "你交了保证金 —— 卡不会来，你的身份信息还会被倒卖。", report: "做对了。正规办卡不收任何前置费用。", pass: "安全。征信有问题请走正规修复途径。" }
+  };
+  C["虚假退费"] = {
+    a: "risk", fix: "选「举报」—— 先理财后退费全是诈骗。",
+    clue: "话术关键词：「<b>国家清退通道</b>」「<b>扫码进官方退费群</b>」「<b>先购买指定理财产品激活额度</b>」。",
+    teach: "凡要求<b>先理财后退费、买产品激活额度</b>的清退方案都是诈骗。机构退费应通过官方公告或法院公告程序执行，不存在「买理财产品才能退」的逻辑。",
+    next: "退费只认官方公告或法院程序；要求先买产品的全部是骗局。",
+    review: { invest: "你买了「激活额度」的理财 —— 那笔钱本身就是骗子的目标。", report: "做对了。退费不需要你先付出任何钱。", pass: "安全。退费请查官方公告。" }
+  };
+  C["提额诈骗"] = {
+    a: "risk", fix: "选「举报」—— 额度由系统自动评估，无法人工操作。",
+    clue: "话术关键词：「<b>缴纳服务费即可永久提额</b>」「<b>内部通道操作</b>」「<b>当天生效</b>」。",
+    teach: "信贷额度由持牌机构<b>基于征信自动评估</b>，任何声称人工提额、内部操作并收取费用的，都是诈骗。",
+    next: "提额只有一种方式：按时还款、积累信用。",
+    review: { invest: "你交了服务费 —— 额度不会变，钱也没了。", report: "做对了。额度是系统算出来的，不是人能操作的。", pass: "安全。信用只能靠还款慢慢积累。" }
+  };
+  C["非法集资"] = {
+    a: "risk", fix: "选「举报」—— 「保本高收益」本身就违法。",
+    clue: "话术关键词：「<b>年化 36%</b>」「<b>保本保息</b>」「<b>国资背景兜底</b>」「<b>名额有限</b>」。",
+    teach: "对照手册 <b>第 ① 步</b>：<i>收益高得离谱又讲不清为什么，就要警惕</i>。承诺「保本高收益」本身已违反金融监管规定 —— 收益越高风险越高，不存在又高又保本的理财。",
+    next: "收益率超过 8% 就要打问号；超过 10% 就要准备损失全部本金。",
+    review: { invest: "你把钱投了进去 —— 「保本」是非法集资最标准的开场白。", report: "做对了。承诺保本保息就是违法的红灯。", pass: "安全。正规理财从不承诺保本。" }
+  };
+  C["传销资金盘"] = {
+    a: "risk", fix: "选「举报」—— 靠拉人头计酬就是传销。",
+    clue: "话术关键词：「<b>拉 3 个人入金</b>」「<b>收益直接翻倍</b>」「<b>层级返利</b>」。",
+    teach: "靠「<b>拉人头</b>」计酬、按层级返利，是传销式资金盘的标准特征。它的收益不来自任何真实经营，只来自后来者的本金。",
+    next: "凡收益与发展下线挂钩的，一律是传销，立即举报。",
+    review: { invest: "你入了金 —— 你还会被鼓励去拉亲友，成为传销链条的一环。", report: "做对了。没有真实经营就没有真实收益。", pass: "安全。投资应该投向产生现金流的东西。" }
+  };
+  C["钓鱼短信"] = {
+    a: "risk", fix: "选「举报」—— 银行不会用短信链接让你填密码。",
+    clue: "话术关键词：「<b>账户异常</b>」「<b>点击链接验证身份</b>」。",
+    teach: "银行<b>不会</b>用短信链接让你填密码、验证码。官方短信号码与网址要自行核对，不要点开来路不明的链接。",
+    next: "不点短信链接；如需核实，自己从官方 APP 或卡面客服进入。",
+    review: { invest: "你点了链接并填了信息 —— 账户随即被盗刷。", report: "做对了。链接可以伪造，卡面电话不能。", pass: "安全。收到「异常」提示先自己打开官方 APP 看。" }
+  };
+  C["非法外汇"] = {
+    a: "risk", fix: "选「举报」—— 境内未经批准的外汇平台均属非法。",
+    clue: "话术关键词：「<b>稳赚不赔</b>」「<b>入金还送体验金</b>」「<b>境外平台</b>」。",
+    teach: "境内<b>未经批准</b>的外汇保证金交易平台均属非法，本金不受任何保护。对照手册 <b>第 ⑤ 步</b>：收益承诺得越绝对，越是不可信。",
+    next: "外汇交易只走境内持牌机构；境外平台本金不受保护。",
+    review: { invest: "你入了金 —— 这类平台随时可能关站跑路，本金追不回。", report: "做对了。「稳赚不赔」四个字本身就是最大的风险信号。", pass: "安全。投资先问一句：它靠什么赚钱。" }
+  };
+  C["养老诈骗"] = {
+    a: "risk", fix: "选「举报」—— 以房养老是典型骗局话术。",
+    clue: "话术关键词：「<b>以房养老</b>」「<b>把房子抵押给某公司</b>」「<b>每月领高额养老金</b>」。",
+    teach: "不法分子借「以房养老」名义骗取房产抵押，最终房子被强制执行。对照手册 <b>第 ⑤ 步</b>：涉及房产、养老钱等高风险决策，必须子女陪同并走公证程序。",
+    next: "涉及房产抵押一律走公证 + 子女陪同；「以房养老」请认准官方试点。",
+    review: { invest: "你抵押了房子 —— 这是很多老人失去唯一住房的方式。", report: "做对了。养老钱和房产是诈骗分子的首选目标。", pass: "安全。任何涉及房产的决定都要多方核实。" }
+  };
+  C["非法发行"] = {
+    a: "risk", fix: "选「举报」—— 向公众转卖「原始股」多为非法。",
+    clue: "话术关键词：「<b>内部原始股</b>」「<b>上市翻十倍</b>」「<b>限时限量</b>」。",
+    teach: "向非特定对象公开转让「原始股」，多为非法发行证券或诈骗。对照手册 <b>第 ③ 步</b>：<i>突然出现的大单 / 非常规交易，往往是粉饰出来的</i>。",
+    next: "原始股只能通过持牌机构参与；微信群卖股一律是骗局。",
+    review: { invest: "你买了「原始股」 —— 它既不能流通，也不受法律保护。", report: "做对了。证券发行必须经监管批准。", pass: "安全。股权投资请走持牌机构。" }
+  };
+})();
+(function () {
+  var C = window.XRAY_SOL.CASE;
+  C["套路贷"] = {
+    a: "risk", fix: "选「举报」—— 放款前收费的一律是诈骗。",
+    clue: "话术关键词：「<b>先交保证金</b>」「<b>刷够流水</b>」「<b>贷款马上下</b>」。",
+    teach: "正规贷款<b>放款前不收取任何费用</b>，更不会让你「刷流水」。对照手册 <b>第 ⑤ 步</b>：对方要求你先付钱 —— 这就是红灯。",
+    next: "贷款只走银行 / 持牌机构；放款前收费的全部拒绝。",
+    review: { invest: "你交了保证金 —— 后面还有「解冻费」「验证金」等着你。", report: "做对了。先收费后放款 = 套路贷。", pass: "安全。缺钱请找正规持牌机构。" }
+  };
+  C["信息泄露"] = {
+    a: "risk", fix: "选「举报」—— 一次刷脸 + 卡证可能被用来开户洗钱。",
+    clue: "话术关键词：「<b>扫码免费领</b>」「<b>身份证 + 银行卡 + 人脸识别</b>」。",
+    teach: "一次「刷脸 + 卡证」组合可能被用于开户、洗钱，个人信息不能随便给。对照手册 <b>第 ④ 步</b>：这是典型的<b>信用类黄灯</b> —— 不是立即损失，但风险会滞后爆发。",
+    next: "不参与需要身份证 + 银行卡 + 人脸的街头扫码活动。",
+    review: { invest: "你扫了码 —— 你的身份信息会被打包转卖，后果滞后出现。", report: "做对了。个人信息是最不该外泄的资产。", pass: "安全。免费的东西往往最贵。" }
+  };
+  C["征信骗局"] = {
+    a: "risk", fix: "选「举报」—— 征信记录任何机构都无权删除。",
+    clue: "话术关键词：「<b>专业代办征信修复</b>」「<b>花钱洗白逾期记录</b>」。",
+    teach: "征信记录<b>任何机构都无权随意删除</b>，「修复」一律是骗局。对照手册 <b>第 ④ 步</b>：信用记录是可查证的硬指标，声称能人为修改的必然是假。",
+    next: "征信有异议走官方异议申请流程，不花一分钱。",
+    review: { invest: "你交了钱 —— 记录不会变，你的信息还被拿走了。", report: "做对了。征信只能靠时间和还款修复。", pass: "安全。征信异议申请是免费的。" }
+  };
+  C["养老非法集资"] = {
+    a: "risk", fix: "选「举报」—— 高回报 + 礼品引流是养老领域常见套路。",
+    clue: "话术关键词：「<b>年回报 20%</b>」「<b>还送旅游</b>」「<b>投资养老院</b>」。",
+    teach: "高额回报 + 礼品引流，是养老领域非法集资的常见套路。对照手册 <b>第 ① 步</b>：收益高得离谱又说不清来源，就要警惕。",
+    next: "涉老投资务必子女陪同；超过 8% 的回报承诺一律不信。",
+    review: { invest: "你投了 —— 前几期的小额返利正是为了让你加大投入。", report: "做对了。养老钱经不起一次本金损失。", pass: "安全。养老投资请认准持牌机构。" }
+  };
+  C["帮信罪"] = {
+    a: "risk", fix: "选「举报」—— 出租银行卡可能构成犯罪。",
+    clue: "话术关键词：「<b>出价 5000 元租你的银行卡</b>」「<b>就借一天</b>」。",
+    teach: "出租、出借银行卡可能构成<b>帮助信息网络犯罪活动罪</b>，要负刑事责任。这已经不是投资风险问题，是违法问题。",
+    next: "银行卡、电话卡绝不外借；发现收购卡证的立即报警。",
+    review: { invest: "你借了卡 —— 你的账户会被用于洗钱，你要负刑责。", report: "做对了。「帮信罪」是近年最高发的涉银行卡犯罪。", pass: "安全。任何租借卡证的请求都要报警。" }
+  };
+  C["银行飞单"] = {
+    a: "risk", fix: "选「举报」—— 银行不承担「飞单」的兑付责任。",
+    clue: "话术关键词：「<b>私下推荐</b>」「<b>不进系统</b>」「<b>收益是存款的 5 倍</b>」「<b>一样保本</b>」。",
+    teach: "「<b>飞单</b>」是员工私售的第三方产品，<b>银行不承担兑付责任</b>。对照手册 <b>第 ① 步</b>：高收益 + 承诺保本，两个特征同时出现就是红灯。",
+    next: "买理财认准产品登记编码，可在中国理财网验真。",
+    review: { invest: "你买了飞单 —— 出事后银行不认，你只能找推销的个人。", report: "做对了。不在系统里的产品，一律不买。", pass: "安全。买理财请查产品登记编码。" }
+  };
+  C["杀猪盘"] = {
+    a: "risk", fix: "选「举报」—— 晒单群的目的是把你引到虚假平台。",
+    clue: "话术关键词：「<b>老师带你一周翻倍</b>」「<b>天天有人晒盈利截图</b>」。",
+    teach: "晒单群里多是「<b>托儿</b>」，目的是诱导你到虚假平台入金。对照手册 <b>第 ③ 步</b>：<i>突然出现的、无法核实的盈利，往往是粉饰出来的</i>。",
+    next: "投资群里的盈利截图一律不可信；平台资质先去证监会官网查。",
+    review: { invest: "你入了金 —— 那些「盈利」是后台改出来的数字。", report: "做对了。无法核实的盈利就是最大的风险信号。", pass: "安全。投资前先查平台是否持牌。" }
+  };
+  C["传销返利"] = {
+    a: "risk", fix: "选「举报」—— 靠新人钱付旧人，本质是庞氏结构。",
+    clue: "话术关键词：「<b>购物全额返还</b>」「<b>发展下线还能拿提成</b>」。",
+    teach: "「全额返利 + 下线提成」本质是<b>庞氏结构</b>，靠新人的钱付旧人。对照手册 <b>第 ③ 步</b>：这类增长不可持续，一旦新资金断流立即崩塌。",
+    next: "凡是返还依赖发展下线的，一律是传销。",
+    review: { invest: "你参与了 —— 先返的那几笔是为了让你加大投入。", report: "做对了。没有真实商品利润的返利必然崩盘。", pass: "安全。返利要看它用什么钱返。" }
+  };
+  C["游戏交易诈骗"] = {
+    a: "risk", fix: "选「举报」—— 交易只走平台担保。",
+    clue: "话术关键词：「<b>陌生客服</b>」「<b>私下交易更便宜</b>」「<b>先付款解锁</b>」。",
+    teach: "脱离平台的私下交易没有担保，付款后即被拉黑。对照手册 <b>第 ④ 步</b>：脱离监管渠道的交易本身就是一条黄灯。",
+    next: "虚拟物品交易只走平台担保，私下转账一律拒绝。",
+    review: { invest: "你私下付了款 —— 没有担保的交易不受任何保护。", report: "做对了。平台担保存在的意义就是防这个。", pass: "安全。便宜几块钱不值得冒全损风险。" }
+  };
+
+  /* ---- 正面样本：这些是「可以接受」的正规场景 ---- */
+  C["净值型理财"] = {
+    a: "safe", fix: "选「可以接受」—— 正规理财不承诺保本，但必须明示风险。",
+    clue: "关键词：「<b>R2 中低风险</b>」「<b>业绩比较基准 2.8%—3.4%</b>」「<b>风险揭示书</b>」「<b>可在官网查验的产品编码</b>」。",
+    teach: "对照手册 <b>第 ① 步</b>：正规净值型理财<b>不承诺保本</b>，但会明示风险等级、业绩比较基准与产品登记编码。可在中国理财网输入编码验真 —— 能验真，就是绿灯。",
+    next: "买理财先查产品登记编码，可在中国理财网验真。",
+    review: { invest: "做对了。能验真的 + 明示风险的，才是合规产品。", report: "误判 —— 把合规产品当风险，会错过稳健收益。", pass: "错过了。这类产品是资产配置里的压舱石。" }
+  };
+  C["持牌机构"] = {
+    a: "safe", fix: "选「可以接受」—— 持牌 + 临柜面签 + 风险测评，三重合规。",
+    clue: "关键词：「<b>持牌券商</b>」「<b>营业部现场</b>」「<b>本人临柜</b>」「<b>风险测评</b>」「<b>风险揭示书</b>」。",
+    teach: "核验机构资质可在中国证监会官网查询。持牌机构<b>必须临柜面签并做风险测评</b>，凡声称远程包办开户的都不可信。",
+    next: "开户前先去证监会官网查机构是否持牌。",
+    review: { invest: "做对了。临柜 + 面签 + 测评是合规的标配。", report: "误判 —— 持牌机构的正规流程不该被当成风险。", pass: "安全但错过了。正规渠道是唯一安全的开户方式。" }
+  };
+  C["保险常识"] = {
+    a: "safe", fix: "选「可以接受」—— 现金价值白纸黑字写进合同。",
+    clue: "关键词：「<b>现金价值表明确写入合同</b>」「<b>业务员只领佣金</b>」「<b>不涉及额外费用</b>」。",
+    teach: "保险产品的<b>现金价值会白纸黑字写进合同</b>，不存在「内部名额」。签收后有<b>犹豫期</b>，期内可无条件退保 —— 有合同、有犹豫期，就是绿灯。",
+    next: "买保险认准合同条款与犹豫期；口头承诺一律不作数。",
+    review: { invest: "做对了。写进合同的才是保障。", report: "误判 —— 只看条款不看话术，才能分清真假。", pass: "安全。犹豫期是你最重要的后悔药。" }
+  };
+  C["公积金常识"] = {
+    a: "safe", fix: "选「可以接受」—— 政务渠道一律免费。",
+    clue: "关键词：「<b>政务 APP 办理</b>」「<b>不收取任何手续费</b>」「<b>凭租赁合同提取</b>」。",
+    teach: "公积金提取一律通过<b>官方政务渠道免费办理</b>，任何代提公积金并收取手续费的中介都涉嫌违法。",
+    next: "公积金业务只走官方政务 APP，全程免费。",
+    review: { invest: "做对了。免费的政务渠道才是唯一正解。", report: "误判 —— 官方公告不该被当成风险。", pass: "安全。凡是收费代办的都涉嫌违法。" }
+  };
+  C["用卡常识"] = {
+    a: "safe", fix: "选「可以接受」—— 换卡只走官方渠道，不索要验证码。",
+    clue: "关键词：「<b>银行寄来的通知</b>」「<b>通过手机银行确认地址</b>」「<b>不涉及任何转账</b>」。",
+    teach: "银行换卡<b>只经官方渠道办理</b>，不会索要卡片验证码，更不会要求你把钱转到任何账户。<b>不涉及转账</b>是判断真伪最硬的一条。",
+    next: "凡是要求转账或索要验证码的「银行业务」，一律是诈骗。",
+    review: { invest: "做对了。不转账、不索码，是正规银行业务的底线。", report: "误判 —— 官方换卡流程不该被当成风险。", pass: "安全。收到通知请自己在官方 APP 内确认。" }
+  };
+  C["反诈宣传"] = {
+    a: "safe", fix: "选「可以接受」—— 96110 是官方唯一预警劝阻电话。",
+    clue: "关键词：「<b>金融知识进万家</b>」「<b>辖区派出所反诈民警</b>」「<b>96110 宣传册</b>」。",
+    teach: "<b>96110 是全国反诈专线</b>，也是官方唯一的预警劝阻电话。接到它的来电，说明你或家人正遭遇诈骗，请务必接听。",
+    next: "96110 来电务必接听；主动拨打可咨询和举报。",
+    review: { invest: "做对了。认准 96110，就认准了官方反诈入口。", report: "误判 —— 把反诈宣传当风险，会错过最重要的保护。", pass: "安全。多参加一次宣传，就少一次被骗。" }
+  };
 })();
 </script>
 

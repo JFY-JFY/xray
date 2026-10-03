@@ -662,7 +662,7 @@
         </button>
         <button class="mode-card" data-mode="demo">
           <span class="mc-ico">🎬</span>
-          <span class="mc-name">演示局 · 8 回合</span>
+          <span class="mc-name">演示局 · 2 回合</span>
           <span class="mc-ds">快节奏走完整闭环，适合现场展示</span>
         </button>
       </div>
@@ -8820,11 +8820,11 @@ three/build/three.module.js:
 </script>
 
 <script>
-/* ===== @ xray-demo-mode 演示局（8 回合快速局） ===== */
+/* ===== @ xray-demo-mode 演示局（2 回合极速局） ===== */
 ;(function () {
   "use strict";
   try {
-    var DEMO_ROUNDS = 8, NORMAL_ROUNDS = 20;
+    var DEMO_ROUNDS = 2, NORMAL_ROUNDS = 20;
     function applyRounds(n) {
       try {
         if (window.GAME && window.GAME.CFG) window.GAME.CFG.ROUNDS = n;
@@ -8839,6 +8839,24 @@ three/build/three.module.js:
         applyRounds(c.dataset.mode === "demo" ? DEMO_ROUNDS : NORMAL_ROUNDS);
       });
     });
+
+    /* 路演调试：控制台可实时改演示局回合数，不必改代码
+       用法：XRAY_DEMO.set(4)  /  XRAY_DEMO.get()
+       注意挂在独立命名空间上，避免被主模块的 window.XRAY = {...} 覆盖 */
+    try {
+      window.XRAY_DEMO = {
+        get: function () { return DEMO_ROUNDS; },
+        set: function (n) {
+          n = Math.max(1, parseInt(n, 10) || DEMO_ROUNDS);
+          DEMO_ROUNDS = n;
+          var card = document.querySelector('.mode-card[data-mode="demo"] .mc-name');
+          if (card) card.textContent = "演示局 · " + n + " 回合";
+          var cur = document.querySelector(".mode-card.selected");
+          if (cur && cur.dataset.mode === "demo") applyRounds(n);
+          return n;
+        }
+      };
+    } catch (e) { }
   } catch (e) {
     if (typeof console !== "undefined") console.warn("[xray-demo]", e);
   }

@@ -9130,7 +9130,9 @@ body{ letter-spacing:.2px; }
 /* ---------- 11. 弹窗 ---------- */
 .modal{ background:radial-gradient(circle at 50% 38%,rgba(12,24,58,.62),rgba(2,4,12,.90));
   backdrop-filter:blur(10px) saturate(120%); -webkit-backdrop-filter:blur(10px) saturate(120%); }
-.card{ border-radius:26px; overflow:visible; isolation:isolate;
+/* 注意：这里刻意不再写 overflow —— 原版 .card 是 overflow-y:auto 的滚动容器，
+   滚动已改由内层 .cardIn 承担（见 22 节），外壳只负责裁切圆角与固定装饰层。 */
+.card{ border-radius:26px; isolation:isolate;
   background:linear-gradient(165deg,rgba(34,52,104,.94),rgba(9,14,34,.96));
   border:1px solid rgba(150,200,255,.30);
   box-shadow:0 40px 110px -20px rgba(0,0,0,.75), inset 0 1px 0 rgba(255,255,255,.18);
@@ -9264,6 +9266,39 @@ html[data-mode="demo"]  #fxFrame i{ border-color:rgba(255,215,106,.85) }
 /* 飘字（3D→屏幕）更醒目 */
 .float{ font-size:21px; letter-spacing:.5px; -webkit-text-stroke:1px rgba(0,0,0,.4);
   text-shadow:0 2px 10px rgba(0,0,0,.9), 0 0 26px currentColor; }
+
+/* ---------- 22. 长报告滚动（终局胜利报告 / 手册 / 判定卡） ----------
+   目标：整份报告当成"一长条"，滚轮从上往下一路滚到底，不用在嵌套框里迷路。
+   做法：.card 只做外壳（overflow:hidden，装饰层固定不跑），
+        真实滚动交给自动注入的 .cardIn；并把卡片内所有嵌套 max-height+overflow 拍平。 */
+.card.xp-scroll{ max-height:none !important; overflow:hidden !important; }
+.cardIn{ max-height:calc(88vh - 52px); overflow-y:auto; overscroll-behavior:contain;
+  scrollbar-width:thin; scrollbar-color:rgba(120,200,255,.45) transparent; }
+.cardIn::-webkit-scrollbar{ width:9px }
+.cardIn::-webkit-scrollbar-track{ background:rgba(255,255,255,.04); border-radius:99px }
+.cardIn::-webkit-scrollbar-thumb{ border-radius:99px;
+  background:linear-gradient(180deg,rgba(79,240,255,.55),rgba(120,160,255,.32));
+  box-shadow:0 0 10px rgba(79,240,255,.35) }
+.cardIn::-webkit-scrollbar-thumb:hover{ background:linear-gradient(180deg,rgba(79,240,255,.85),rgba(150,190,255,.5)) }
+
+/* 底部常驻操作条：报告再长，「再玩一局」永远一键可点 */
+.cardIn .xp-foot{ position:sticky; bottom:-24px; z-index:4;
+  margin:-12px -26px -24px; padding:14px 26px 22px;
+  flex-direction:column; align-items:center; gap:10px;
+  background:linear-gradient(180deg,rgba(10,16,38,0),rgba(10,16,38,.90) 38%,rgba(10,16,38,.96)); }
+.cardIn .xp-foot .xp-hint{ font-size:11.5px; letter-spacing:1.6px; color:#9ff8ff; white-space:nowrap;
+  text-shadow:0 0 12px rgba(79,240,255,.5); animation:xpHintBob 1.9s ease-in-out infinite; }
+.cardIn .xp-foot .xp-hint.gone{ display:none; }
+@keyframes xpHintBob{ 0%,100%{ transform:translateY(0); opacity:.7 } 50%{ transform:translateY(3px); opacity:1 } }
+
+/* 右侧阅读进度条 */
+.xp-prog{ position:absolute; top:16px; right:6px; bottom:16px; width:3px; border-radius:99px;
+  background:rgba(255,255,255,.09); pointer-events:none; z-index:6; opacity:0; transition:opacity .35s; }
+.xp-prog.on{ opacity:1; }
+.xp-prog i{ position:absolute; left:0; right:0; top:0; height:0; border-radius:99px;
+  background:linear-gradient(180deg,#4ff0ff,#ffd76a);
+  box-shadow:0 0 9px rgba(79,240,255,.85); }
+@media (max-width:760px){ .xp-prog{ display:none } }
 
 /* ---------- 20. 降级 / 无障碍 / 响应式 ---------- */
 html.modal-open #fxFrame{ opacity:.10 !important }
@@ -9489,6 +9524,169 @@ html.lowfx #fxFrame{ animation:none; opacity:.22; }
       }).observe(em, { attributes: true, attributeFilter: ["class"] });
     }
   } catch (e) { }
+
+  /* ---------- 10. 长报告滚动：整份报告一滚到底 ---------- */
+  try {
+    var SC = { card: null };
+
+    /* 拍平卡片内所有"嵌套滚动区"：取消它们的 max-height，让滚动权收归 .cardIn */
+    function flatten(root) {
+      if (!root || !root.querySelectorAll) return 0;
+      var all = root.querySelectorAll("*"), n = 0;
+      for (var i = 0; i < all.length; i++) {
+        var el = all[i], st = el.style || {};
+        if (el.classList && el.classList.contains("xp-foot")) continue;
+        var ovf = st.overflow || st.overflowY || "";
+        var isScroller = /auto|scroll/.test(ovf);
+        if (st.maxHeight && st.maxHeight !== "none") { st.maxHeight = "none"; n++; }
+        if (isScroller) { st.overflow = "visible"; st.overflowY = "visible"; st.overflowX = "visible"; }
+      }
+      return n;
+    }
+
+    /* 给 .card 套一层 .cardIn 滚动容器（幂等） */
+    function wrapCard(card) {
+      if (!card || card.__xp) return;
+      card.__xp = 1;
+      var inner = D.createElement("div");
+      inner.className = "cardIn";
+      while (card.firstChild) inner.appendChild(card.firstChild);
+      card.appendChild(inner);
+      card.classList.add("xp-scroll");
+      card.__xpInner = inner;
+      flatten(inner);
+
+      /* 底部常驻操作条：把"最后一行含按钮"的容器设为 sticky，并塞滚动提示 */
+      try {
+        var foot = inner.lastElementChild;
+        if (foot && foot.querySelector && foot.querySelector("button")) {
+          foot.classList.add("xp-foot");
+          var hint = D.createElement("div");
+          hint.className = "xp-hint";
+          hint.textContent = "↓ 滚轮向下 · 从上往下看完整报告";
+          foot.insertBefore(hint, foot.firstChild);
+          inner.__xpHint = hint;
+        }
+      } catch (e) { }
+
+      /* 右侧进度条（挂在不滚动的外壳上，始终固定） */
+      try {
+        var pg = D.createElement("div");
+        pg.className = "xp-prog";
+        pg.innerHTML = "<i></i>";
+        card.appendChild(pg);
+        inner.__xpProg = pg.firstChild;
+        inner.__xpProgBox = pg;
+      } catch (e) { }
+
+      /* 后续注入的内容（终局复盘卡片等）自动拍平 + 刷新进度 */
+      try {
+        new MutationObserver(function (ms) {
+          var grew = false;
+          for (var i = 0; i < ms.length; i++) if (ms[i].addedNodes && ms[i].addedNodes.length) grew = true;
+          if (!grew) return;
+          flatten(inner);
+          if (SC.card === card) sync();
+        }).observe(inner, { childList: true, subtree: true });
+      } catch (e) { }
+    }
+
+    /* 进度条 / 提示同步 */
+    function sync() {
+      var c = SC.card;
+      if (!c || !c.__xpInner) return;
+      var inner = c.__xpInner;
+      var max = inner.scrollHeight - inner.clientHeight;
+      var can = max > 8;
+      var box = inner.__xpProgBox, bar = inner.__xpProg;
+      if (box) box.classList.toggle("on", can);
+      if (bar) {
+        var ratio = can ? inner.clientHeight / inner.scrollHeight : 0;
+        var h = can ? Math.max(7, ratio * 100) : 0;
+        bar.style.height = h + "%";
+        bar.style.top = (can ? (inner.scrollTop / max) * (100 - h) : 0) + "%";
+      }
+      if (inner.__xpHint) inner.__xpHint.classList.toggle("gone", !can || inner.scrollTop > 24);
+    }
+
+    /* 当前打开的弹窗：取最后一个可见的（DOM 越靠后 = 绘制越上层） */
+    function pick() {
+      var list = D.querySelectorAll(".modal:not(.hidden)");
+      var m = list.length ? list[list.length - 1] : null;
+      var card = m ? m.querySelector(".card") : null;
+      if (card) wrapCard(card);
+      SC.card = card || null;
+      sync();
+    }
+
+    /* 启动：包装已存在的卡片 + 监听后续动态新增 */
+    D.querySelectorAll(".card").forEach(wrapCard);
+    try {
+      new MutationObserver(function (ms) {
+        for (var i = 0; i < ms.length; i++) {
+          if (!ms[i].addedNodes || !ms[i].addedNodes.length) continue;
+          ms[i].addedNodes.forEach(function (n) {
+            if (n.nodeType !== 1) return;
+            if (n.classList && n.classList.contains("card")) wrapCard(n);
+            if (n.querySelectorAll) n.querySelectorAll(".card").forEach(wrapCard);
+          });
+        }
+        if (SC.card) sync();
+      }).observe(D.body, { childList: true, subtree: true });
+    } catch (e) { }
+
+    /* 弹窗开合 → 重新认领卡片 */
+    try {
+      D.querySelectorAll(".modal").forEach(function (m) {
+        new MutationObserver(function () { setTimeout(pick, 0); })
+          .observe(m, { attributes: true, attributeFilter: ["class"] });
+      });
+    } catch (e) { }
+    pick();
+
+    /* 滚轮：在弹窗任意位置滚动，整份报告跟着走；到边界就交还浏览器 */
+    D.addEventListener("wheel", function (e) {
+      var c = SC.card;
+      if (!c || !c.__xpInner) return;
+      var inner = c.__xpInner;
+      var max = inner.scrollHeight - inner.clientHeight;
+      if (max <= 8) return;                                  /* 装得下，不用滚 */
+      var dy = e.deltaY;
+      if (e.deltaMode === 1) dy *= 16;
+      else if (e.deltaMode === 2) dy *= inner.clientHeight;
+      if (dy < 0 && inner.scrollTop <= 0) return;             /* 已在顶部 */
+      if (dy > 0 && inner.scrollTop >= max - 1) return;      /* 已在底部 */
+      inner.scrollTop += dy;
+      e.preventDefault();
+      sync();
+    }, { passive: false });
+
+    /* 键盘：PgUp / PgDn / Home / End（判定弹窗打开时不抢 ↑↓） */
+    D.addEventListener("keydown", function (e) {
+      var c = SC.card;
+      if (!c || !c.__xpInner) return;
+      var inner = c.__xpInner, h = inner.clientHeight, step = null;
+      var qm = D.getElementById("quizModal");
+      var quizOpen = qm && !qm.classList.contains("hidden");
+      if (e.key === "PageDown") step = h * 0.88;
+      else if (e.key === "PageUp") step = -h * 0.88;
+      else if (e.key === "Home") { inner.scrollTop = 0; e.preventDefault(); sync(); return; }
+      else if (e.key === "End") { inner.scrollTop = inner.scrollHeight; e.preventDefault(); sync(); return; }
+      else if (!quizOpen && (e.key === "ArrowDown" || e.key === "ArrowUp")) step = e.key === "ArrowDown" ? 64 : -64;
+      if (step === null) return;
+      var before = inner.scrollTop;
+      inner.scrollTop += step;
+      if (inner.scrollTop !== before) { e.preventDefault(); sync(); }
+    }, { passive: false });
+
+    D.addEventListener("resize", sync);
+    D.addEventListener("scroll", function (e) {
+      var c = SC.card;
+      if (c && c.__xpInner && (e.target === c.__xpInner || c.__xpInner.contains(e.target))) sync();
+    }, true);
+  } catch (e) {
+    try { console.warn("[X-RAY-PRO] 长报告滚动层未启用：", e); } catch (e2) { }
+  }
 })();
 </script>
 
